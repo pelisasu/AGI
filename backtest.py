@@ -1,14 +1,9 @@
 #!/usr/bin/env python3
 """
 =============================================================================
-BACKTEST HARNESS v31.0
+BACKTEST HARNESS v31.2 (LEVEL 3)
 =============================================================================
-Test strategi di data historis SEBELUM live. Ini yang bikin lo tahu bot
-profitable atau tidak.
-
-Pakai:
-  python backtest.py --deriv --days 60
-  python backtest.py --csv data.csv --min-score 65
+Fix: Fallback Deriv -> Yahoo GC=F untuk GitHub Actions.
 =============================================================================
 """
 
@@ -27,9 +22,6 @@ from precision_entry import calculate_precise_entry
 from agi_core import detect_regime, grade_signal, grade_at_least
 
 
-# =============================================================================
-# DATA STRUCTS
-# =============================================================================
 @dataclass
 class BacktestTrade:
     entry_time: str
@@ -66,9 +58,6 @@ class BacktestResult:
     trades: List[dict] = field(default_factory=list)
 
 
-# =============================================================================
-# CORE
-# =============================================================================
 def _atr(df, p=14):
     try:
         h, l, c = df["high"], df["low"], df["close"]
@@ -82,6 +71,8 @@ def _atr(df, p=14):
 
 def _trend_label(df):
     try:
+        if df is None or len(df) < 50:
+            return "NEUTRAL"
         s50 = df["close"].rolling(50).mean().iloc[-1]
         pr = float(df["close"].iloc[-1])
         if pd.isna(s50):
@@ -95,8 +86,7 @@ def _trend_label(df):
         return "NEUTRAL"
 
 
-def _score_engines(df: pd.DataFrame) -> tuple:
-    """Return buy_w, sell_w, states."""
+def _score_engines(df):
     buy_w = sell_w = 0.0
     states = {}
     for name, fn in ENGINES:
@@ -112,10 +102,7 @@ def _score_engines(df: pd.DataFrame) -> tuple:
     return buy_w, sell_w, states
 
 
-def _simulate_exit(df: pd.DataFrame, entry_idx: int, signal: str,
-                    entry: float, sl: float, tp1: float,
-                    max_bars: int = 24) -> tuple:
-    """Cek exit pakai OHLC, konservatif (SL dulu di bar sama)."""
+def _simulate_exit(df, entry_idx, signal, entry, sl, tp1, max_bars=24):
     for i in range(entry_idx + 1, min(entry_idx + 1 + max_bars, len(df))):
         row = df.iloc[i]
         if signal == "BUY":
@@ -133,26 +120,13 @@ def _simulate_exit(df: pd.DataFrame, entry_idx: int, signal: str,
             df.index[last_idx].isoformat())
 
 
-# =============================================================================
-# BACKTEST
-# =============================================================================
-def run_backtest(df_m15: pd.DataFrame,
-                  df_h1: Optional[pd.DataFrame] = None,
-                  df_h4: Optional[pd.DataFrame] = None,
-                  min_confluence: float = 65.0,
-                  min_precision: float = 70.0,
-                  min_grade: str = "A",
-                  warmup: int = 250,
-                  cooldown_bars: int = 4,
-                  max_bars: int = 24,
-                  require_mtf: bool = True) -> BacktestResult:
-    """
-    Walk-forward backtest. Tidak ada look-ahead.
-    """
+def run_backtest(df_m15, df_h1=None, df_h4=None,
+                  min_confluence=65.0, min_precision=70.0,
+                  min_grade="A", warmup=250, cooldown_bars=4,
+                  max_bars=24, require_mtf=True):
     result = BacktestResult()
     if df_m15 is None or len(df_m15) < warmup + 20:
         return result
-
     if df_h1 is None:
         df_h1 = df_m15
     if df_h4 is None:
@@ -166,28 +140,24 @@ def run_backtest(df_m15: pd.DataFrame,
             i += 1
             continue
 
-        # Slice M15 window
         window = df_m15.iloc[max(0, i - 250):i + 1]
         if len(window) < 100:
             i += 1
             continue
 
-        # Regime
         try:
             regime_state = detect_regime(window)
         except Exception:
             i += 1
             continue
 
-        # HTF trend (pakai data sampai i)
-        h1_slice = df_h1[df_h1.index <= df_m15.index[i]] if \
-            isinstance(df_h1.index, pd.DatetimeIndex) else df_h1
-        h4_slice = df_h4[df_h4.index <= df_m15.index[i]] if \
-            isinstance(df_h4.index, pd.DatetimeIndex) else df_h4
-        h1_trend = _trend_label(h1_slice) if len(h1_slice) >= 50 else "NEUTRAL"
-        h4_trend = _trend_label(h4_slice) if len(h4_slice) >= 50 else "NEUTRAL"
+        h1_slice = df_h1[df_h1.index <= df_m15.index[i]] \
+            if isinstance(df_h1.index, pd.DatetimeIndex) else df_h1
+        h4_slice = df_h4[df_h4.index <= df_m15.index[i]] \
+            if isinstance(df_h4.index, pd.DatetimeIndex) else df_h4
+        h1_trend = _trend_label(h1_slice)
+        h4_trend = _trend_label(h4_slice)
 
-        # Engines
         buy_w, sell_w, states = _score_engines(window)
         if "BULLISH" in h1_trend:
             buy_w += 2.5
@@ -210,17 +180,13 @@ def run_backtest(df_m15: pd.DataFrame,
 
         signal = "BUY" if buy_w > sell_w else "SELL"
 
-        # MTF filter
         if require_mtf:
-            aligned = (
-                (signal == "BUY" and "BULLISH" in h1_trend) or
-                (signal == "SELL" and "BEARISH" in h1_trend)
-            )
+            aligned = ((signal == "BUY" and "BULLISH" in h1_trend) or
+                       (signal == "SELL" and "BEARISH" in h1_trend))
             if not aligned:
                 i += 1
                 continue
 
-        # Grade
         atr = _atr(window)
         try:
             grade_info = grade_signal(consensus, signal, states,
@@ -234,7 +200,6 @@ def run_backtest(df_m15: pd.DataFrame,
             i += 1
             continue
 
-        # Precision entry
         try:
             entry_data = calculate_precise_entry(
                 window, signal, float(window["close"].iloc[-1]),
@@ -248,13 +213,11 @@ def run_backtest(df_m15: pd.DataFrame,
             i += 1
             continue
 
-        # Simulasi (pakai entry_ideal)
         exit_price, reason, exit_time = _simulate_exit(
             df_m15, i, signal, entry_data.entry_ideal,
             entry_data.sl, entry_data.tp1, max_bars=max_bars
         )
 
-        # PnL R
         risk = abs(entry_data.entry_ideal - entry_data.sl)
         if risk <= 0:
             i += 1
@@ -288,7 +251,7 @@ def run_backtest(df_m15: pd.DataFrame,
     return result
 
 
-def _finalize(r: BacktestResult):
+def _finalize(r):
     if not r.trades:
         return
     rs = np.array([t["pnl_r"] for t in r.trades])
@@ -315,7 +278,6 @@ def _finalize(r: BacktestResult):
     if rs.std() > 1e-9:
         r.sharpe = round(float(rs.mean() / rs.std() * np.sqrt(252)), 3)
 
-    # Per-regime breakdown
     rb = {}
     for t in r.trades:
         reg = t["regime"]
@@ -329,7 +291,6 @@ def _finalize(r: BacktestResult):
         d["r_sum"] = round(d["r_sum"], 2)
     r.regime_breakdown = rb
 
-    # Per-engine accuracy
     ea = {}
     for t in r.trades:
         signal = t["signal"]
@@ -349,10 +310,7 @@ def _finalize(r: BacktestResult):
     r.engine_accuracy = ea
 
 
-# =============================================================================
-# REPORT
-# =============================================================================
-def grade_result(r: BacktestResult) -> str:
+def grade_result(r):
     if r.total_trades < 20:
         return "INSUFFICIENT"
     score = 0
@@ -376,7 +334,7 @@ def grade_result(r: BacktestResult) -> str:
     return "D"
 
 
-def print_report(r: BacktestResult):
+def print_report(r):
     print("\n" + "=" * 65)
     print("BACKTEST REPORT")
     print("=" * 65)
@@ -406,7 +364,7 @@ def print_report(r: BacktestResult):
             print(f"  {name:22s} acc={d['accuracy']:5.1f}% n={d['n']}")
 
 
-def save_report(r: BacktestResult, path: str):
+def save_report(r, path):
     data = asdict(r)
     with open(path, "w") as f:
         json.dump(data, f, indent=2, default=str)
@@ -414,9 +372,10 @@ def save_report(r: BacktestResult, path: str):
 
 
 # =============================================================================
-# DATA LOADERS
+# DATA LOADERS (FIX: fallback Deriv -> Yahoo)
 # =============================================================================
-def load_from_deriv(days: int = 60):
+def load_from_deriv(days=60):
+    """Fetch data dengan fallback: Deriv -> Yahoo GC=F."""
     import importlib.util
     spec = importlib.util.spec_from_file_location(
         "quant_engine", os.path.join(os.path.dirname(__file__),
@@ -426,22 +385,72 @@ def load_from_deriv(days: int = 60):
 
     bars = min(5000, days * 96)
     print(f"Fetching {bars} bars (M15)...")
-    df_m15, _ = q.fetch_deriv(bars, 900)
-    if df_m15 is None:
-        raise RuntimeError("Deriv fetch failed")
 
-    df_h1, _ = q.fetch_deriv(2000, 3600)
-    if df_h1 is None:
-        df_h1, _ = q.fetch_yf_gc("365d", "1h", 100)
+    # --- M15 ---
+    df_m15 = None
+    try:
+        print("  Trying Deriv M15...")
+        df_m15, _ = q.fetch_deriv(bars, 900)
+    except Exception as e:
+        print(f"  Deriv M15 error: {e}")
 
-    df_h4, _ = q.fetch_deriv(1000, 14400)
-    if df_h4 is None:
-        df_h4, _ = q.fetch_yf_gc("2y", "1d", 50)
+    if df_m15 is None or len(df_m15) < 500:
+        print("  Deriv gagal, fallback ke Yahoo GC=F M15...")
+        yf_days = min(days, 55)
+        try:
+            df_m15, _ = q.fetch_yf_gc(f"{yf_days}d", "15m", min_len=200)
+        except Exception as e:
+            print(f"  Yahoo M15 error: {e}")
 
+    if df_m15 is None or len(df_m15) < 200:
+        raise RuntimeError("Semua sumber M15 gagal (Deriv + Yahoo)")
+
+    print(f"  M15 OK: {len(df_m15)} bars")
+
+    # --- H1 ---
+    df_h1 = None
+    try:
+        print("  Trying Deriv H1...")
+        df_h1, _ = q.fetch_deriv(2000, 3600)
+    except Exception:
+        pass
+
+    if df_h1 is None or len(df_h1) < 100:
+        print("  Fallback Yahoo H1...")
+        yf_days_h1 = min(days + 30, 180)
+        try:
+            df_h1, _ = q.fetch_yf_gc(f"{yf_days_h1}d", "1h", min_len=100)
+        except Exception:
+            pass
+
+    if df_h1 is None or len(df_h1) < 100:
+        print("  H1 gagal, pakai M15")
+        df_h1 = df_m15
+
+    # --- H4 ---
+    df_h4 = None
+    try:
+        print("  Trying Deriv H4...")
+        df_h4, _ = q.fetch_deriv(1000, 14400)
+    except Exception:
+        pass
+
+    if df_h4 is None or len(df_h4) < 50:
+        print("  Fallback Yahoo H4...")
+        try:
+            df_h4, _ = q.fetch_yf_gc("2y", "1d", min_len=50)
+        except Exception:
+            pass
+
+    if df_h4 is None or len(df_h4) < 50:
+        print("  H4 gagal, pakai H1")
+        df_h4 = df_h1
+
+    print(f"  H1 OK: {len(df_h1)} bars | H4 OK: {len(df_h4)} bars")
     return df_m15, df_h1, df_h4
 
 
-def load_csv(path: str):
+def load_csv(path):
     df = pd.read_csv(path)
     dc = next((c for c in df.columns
                if "date" in c.lower() or "time" in c.lower()), df.columns[0])
@@ -454,9 +463,6 @@ def load_csv(path: str):
     return df[["open", "high", "low", "close", "volume"]].sort_index()
 
 
-# =============================================================================
-# CLI
-# =============================================================================
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--csv")
@@ -482,13 +488,11 @@ def main():
     print(f"Data: {len(df_m15)} bars | "
           f"{df_m15.index[0]} -> {df_m15.index[-1]}")
 
-    r = run_backtest(
-        df_m15, df_h1, df_h4,
-        min_confluence=args.min_score,
-        min_precision=args.min_precision,
-        min_grade=args.min_grade,
-        require_mtf=not args.no_mtf,
-    )
+    r = run_backtest(df_m15, df_h1, df_h4,
+                      min_confluence=args.min_score,
+                      min_precision=args.min_precision,
+                      min_grade=args.min_grade,
+                      require_mtf=not args.no_mtf)
     print_report(r)
     save_report(r, args.out)
     return 0
