@@ -1,202 +1,78 @@
 #!/usr/bin/env python3
 """
 =============================================================================
-XAUUSD AGI QUANT ENGINE v31.1 (LEVEL 3 - SELF-TUNING)
+BACKTEST HARNESS v31.3 (LEVEL 3)
 =============================================================================
-- 10 institutional engines (BOS, FVG, OB, Liquidity, dll)
-- Precision entry system (limit order di zona)
-- Structural SL/TP
-- Engine Tracker: auto-disable engine jelek per regime
-- Auto-Tuner: parameter optimal dari backtest
-- AGI layer: regime, memory, calibration, meta
-- Gemini debate + reflection
+Fix: Yahoo fetch lokal tanpa truncate 300 bar.
 =============================================================================
 """
 
 import os
 import sys
 import json
-import time
-import sqlite3
+import argparse
 import datetime
-from contextlib import closing
-import pytz
+from dataclasses import dataclass, asdict, field
+from typing import List, Dict, Optional
 import numpy as np
 import pandas as pd
-import requests
-import websocket
 import yfinance as yf
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 
-from agi_core import (
-    detect_regime, detect_anomaly, Memory, Calibrator, MetaLearner,
-    grade_signal, grade_at_least, compose_local_insight,
-)
-from agi_gemini import debate, reflect
-from telegram_utils import send_text, send_photo, is_paused
-from engines import ENGINES
+from engines import ENGINES, find_swings, detect_fvg, detect_order_blocks
 from precision_entry import calculate_precise_entry
-from engine_tracker import EngineTracker
-from auto_tuner import load_tuned
+from agi_core import detect_regime, grade_signal, grade_at_least
+
+
+@dataclass
+class BacktestTrade:
+    entry_time: str
+    exit_time: str
+    signal: str
+    entry: float
+    sl: float
+    tp1: float
+    exit_price: float
+    exit_reason: str
+    pnl_r: float
+    regime: str
+    grade: str
+    precision_score: float
+    consensus: float
+    engine_states: dict = field(default_factory=dict)
+
+
+@dataclass
+class BacktestResult:
+    total_trades: int = 0
+    wins: int = 0
+    losses: int = 0
+    winrate: float = 0.0
+    total_r: float = 0.0
+    avg_r: float = 0.0
+    profit_factor: float = 0.0
+    max_dd_r: float = 0.0
+    sharpe: float = 0.0
+    expectancy: float = 0.0
+    avg_precision: float = 0.0
+    regime_breakdown: dict = field(default_factory=dict)
+    engine_accuracy: dict = field(default_factory=dict)
+    trades: List[dict] = field(default_factory=list)
+
 
 # =============================================================================
-WIB = pytz.timezone("Asia/Jakarta")
-UTC = pytz.UTC
-
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-HEALTHCHECK_URL = os.getenv("HEALTHCHECK_URL", "").strip()
-
-SYMBOL_DERIV = os.getenv("SYMBOL_DERIV", "frxXAUUSD")
-
-# [L3] Load tuned params kalau ada
-_tuned = load_tuned()
-_tp = _tuned.get("params", {})
-
-MIN_CONFLUENCE = float(os.getenv("MIN_CONFLUENCE_SCORE",
-                                  str(_tp.get("min_confluence", 65))))
-MIN_GRADE = os.getenv("MIN_SIGNAL_GRADE", _tp.get("min_grade", "A"))
-MIN_PRECISION = float(os.getenv("MIN_PRECISION_SCORE",
-                                 str(_tp.get("min_precision", 70))))
-COOLDOWN_MIN = int(os.getenv("SIGNAL_COOLDOWN_MINUTES", "60"))
-FORCE_RUN = os.getenv("FORCE_RUN", "false").lower() == "true"
-REQUIRE_MTF_ALIGN = os.getenv("REQUIRE_MTF_ALIGN", "true").lower() == "true"
-
-YAHOO_OFFSET_DEFAULT = float(os.getenv("YAHOO_OFFSET", "-35.00"))
-OFFSET_SAFETY_MIN = float(os.getenv("YAHOO_OFFSET_MIN", "-10.00"))
-OFFSET_SAFETY_MAX = float(os.getenv("YAHOO_OFFSET_MAX", "-60.00"))
-
-CACHE_DIR = ".state_cache"
-os.makedirs(CACHE_DIR, exist_ok=True)
-DB_FILE = os.path.join(CACHE_DIR, "state.db")
-JOURNAL_FILE = os.path.join(CACHE_DIR, "trade_journal.json")
-FAIL_FILE = os.path.join(CACHE_DIR, "failure_count.json")
-
-
-def log(m):
-    print(f"[{datetime.datetime.now(WIB).strftime('%H:%M:%S')}] {m}", flush=True)
-
-
-def _load(p, d):
+# YAHOO DIRECT FETCH (TANPA TRUNCATE)
+# =============================================================================
+def _fetch_yahoo(symbol: str = "GC=F", period: str = "60d",
+                  interval: str = "15m") -> Optional[pd.DataFrame]:
+    """Fetch Yahoo tanpa truncate. Return DataFrame dengan DatetimeIndex UTC."""
     try:
-        with open(p) as f:
-            return json.load(f)
-    except Exception:
-        return d
-
-
-def _save(p, d):
-    tmp = p + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(d, f, indent=2, default=str)
-    os.replace(tmp, p)
-
-
-def _ping(status):
-    if HEALTHCHECK_URL:
-        try:
-            requests.get(f"{HEALTHCHECK_URL}?status={status}", timeout=5)
-        except Exception:
-            pass
-
-
-# =============================================================================
-# PERSISTENCE
-# =============================================================================
-def _init_db():
-    with closing(sqlite3.connect(DB_FILE)) as c:
-        c.execute("""CREATE TABLE IF NOT EXISTS signals (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ts REAL, direction TEXT, price REAL, zone REAL, status TEXT)""")
-        c.commit()
-
-
-def _price_zone(p, b=5.0):
-    return round(p / b) * b
-
-
-def is_duplicate(direction, price, cooldown):
-    zone = _price_zone(price)
-    with closing(sqlite3.connect(DB_FILE)) as c:
-        rows = c.execute(
-            "SELECT ts, direction, price, zone FROM signals "
-            "ORDER BY id DESC LIMIT 5").fetchall()
-    now = time.time()
-    for ts, ld, lp, lz in rows:
-        if (now - ts) / 60 < cooldown:
-            if direction == ld and abs(zone - lz) < 1e-6:
-                return True
-            if direction != ld and abs(price - lp) < 2.0:
-                return True
-    return False
-
-
-def save_signal(direction, price):
-    with closing(sqlite3.connect(DB_FILE)) as c:
-        c.execute("INSERT INTO signals (ts, direction, price, zone, status) "
-                  "VALUES (?,?,?,?,?)",
-                  (time.time(), direction, float(price),
-                   _price_zone(price), "ACTIVE"))
-        c.commit()
-
-
-# =============================================================================
-# DATA FEED
-# =============================================================================
-def fetch_deriv(limit=300, gran=900):
-    url = "wss://ws.derivws.com/websockets/v3?app_id=1089"
-    headers = ["User-Agent: Mozilla/5.0"]
-    for attempt in range(3):
-        ws = None
-        try:
-            ws = websocket.create_connection(url, timeout=8, header=headers)
-            ws.settimeout(8)
-            ws.send(json.dumps({"ticks_history": SYMBOL_DERIV, "count": limit,
-                                "end": "latest", "granularity": gran,
-                                "style": "candles"}))
-            start = time.time()
-            while time.time() - start < 8:
-                try:
-                    res = json.loads(ws.recv())
-                except Exception:
-                    continue
-                if res.get("error"):
-                    break
-                if "candles" in res and res["candles"]:
-                    df = pd.DataFrame(res["candles"])
-                    for c in ("close", "high", "low", "open"):
-                        df[c] = pd.to_numeric(df[c], errors="coerce")
-                    df["volume"] = 100.0
-                    if "epoch" in df.columns:
-                        df.index = pd.to_datetime(df["epoch"], unit="s", utc=True)
-                    df = df.dropna(subset=["close", "high", "low", "open"])
-                    if df.empty:
-                        break
-                    df = df[["open", "high", "low", "close", "volume"]]
-                    return df, float(df["close"].iloc[-1])
-        except Exception:
-            pass
-        finally:
-            if ws:
-                try:
-                    ws.close()
-                except Exception:
-                    pass
-        time.sleep(2)
-    return None, None
-
-
-def fetch_yf_gc(period="5d", interval="15m", min_len=50):
-    try:
-        raw = yf.Ticker("GC=F").history(period=period, interval=interval)
-        if raw is None or len(raw) < min_len:
-            return None, None
-        price = float(raw["Close"].iloc[-1])
+        raw = yf.Ticker(symbol).history(period=period, interval=interval,
+                                          auto_adjust=False)
+        if raw is None or len(raw) < 50:
+            return None
         raw = raw.reset_index()
-        dc = next((c for c in raw.columns if "date" in c.lower()), raw.columns[0])
+        dc = next((c for c in raw.columns if "date" in c.lower()),
+                  raw.columns[0])
         raw = raw.rename(columns={dc: "datetime", "Close": "close",
                                    "High": "high", "Low": "low", "Open": "open"})
         if "Volume" in raw.columns:
@@ -207,114 +83,31 @@ def fetch_yf_gc(period="5d", interval="15m", min_len=50):
         raw["datetime"] = pd.to_datetime(raw["datetime"], utc=True,
                                           errors="coerce")
         raw = raw.dropna(subset=["datetime", "close", "high", "low", "open"])
-        raw = raw.set_index("datetime")
-        return raw[["open", "high", "low", "close", "volume"]].tail(300), price
-    except Exception:
-        return None, None
-
-
-def _clamp_offset(offset):
-    if offset > 0:
-        offset = -abs(offset)
-    return max(OFFSET_SAFETY_MAX, min(OFFSET_SAFETY_MIN, offset))
-
-
-def get_price_and_data():
-    source = "None"
-    raw_price = None
-    df_m15 = None
-    offset = 0.0
-
-    log("Trying Deriv...")
-    df_m15, p = fetch_deriv(300, 900)
-    if p:
-        raw_price = p
-        source = "Deriv"
-        try:
-            offset = float(os.getenv("DERIV_OFFSET", "0"))
-        except Exception:
-            offset = 0.0
-
-    if raw_price is None:
-        log("Trying Yahoo GC=F...")
-        df_yf, p = fetch_yf_gc("5d", "15m")
-        if p:
-            raw_price = p
-            source = "Yahoo GC=F"
-            df_m15 = df_yf
-            offset = _clamp_offset(YAHOO_OFFSET_DEFAULT)
-            log(f"[Offset] default={YAHOO_OFFSET_DEFAULT:+.2f} "
-                f"clamped={offset:+.2f}")
-
-    if raw_price is None or df_m15 is None or df_m15.empty:
-        raise RuntimeError("All feeds failed")
-
-    try:
-        offset += float(os.getenv("MT5_OFFSET", "0"))
-    except Exception:
-        pass
-
-    final = raw_price + offset
-    if offset != 0:
-        df_m15 = df_m15.copy()
-        for c in ("open", "high", "low", "close"):
-            df_m15[c] = df_m15[c].astype(float) + offset
-
-    log(f"Source={source} raw={raw_price:.2f} offset={offset:+.2f} "
-        f"final={final:.2f}")
-
-    df_h1, _ = fetch_deriv(200, 3600)
-    if df_h1 is None:
-        df_h1, _ = fetch_yf_gc("60d", "1h", min_len=100)
-    if df_h1 is not None and offset != 0:
-        df_h1 = df_h1.copy()
-        for c in ("open", "high", "low", "close"):
-            df_h1[c] = df_h1[c].astype(float) + offset
-    if df_h1 is None:
-        df_h1 = df_m15
-
-    df_h4, _ = fetch_deriv(200, 14400)
-    if df_h4 is None:
-        df_h4, _ = fetch_yf_gc("1y", "1d", min_len=50)
-    if df_h4 is not None and offset != 0:
-        df_h4 = df_h4.copy()
-        for c in ("open", "high", "low", "close"):
-            df_h4[c] = df_h4[c].astype(float) + offset
-
-    return final, df_m15, df_h1, df_h4, source, offset
+        raw = raw.set_index("datetime").sort_index()
+        return raw[["open", "high", "low", "close", "volume"]]
+    except Exception as e:
+        print(f"  Yahoo error: {e}")
+        return None
 
 
 # =============================================================================
-# INDICATORS
+# ENGINE SCORING / EXIT SIM / FINALIZE / REPORT (sama seperti v31.2)
 # =============================================================================
-def calc_atr(df, p=14):
+def _atr(df, p=14):
     try:
-        if df is None or len(df) < p + 1:
-            return 8.0
         h, l, c = df["high"], df["low"], df["close"]
-        tr = pd.concat([h - l, (h - c.shift()).abs(),
-                        (l - c.shift()).abs()], axis=1).max(axis=1)
+        tr = pd.concat([h - l, (h - c.shift()).abs(), (l - c.shift()).abs()],
+                       axis=1).max(axis=1)
         v = tr.rolling(p).mean().iloc[-1]
         return float(v) if not pd.isna(v) and v > 0 else 8.0
     except Exception:
         return 8.0
 
 
-def rsi(df, p=14):
+def _trend_label(df):
     try:
-        if df is None or len(df) < p + 1:
-            return pd.Series([50.0])
-        d = df["close"].diff()
-        g = d.where(d > 0, 0).rolling(p).mean()
-        ls = -d.where(d < 0, 0).rolling(p).mean()
-        rs = g / (ls + 1e-9)
-        return (100 - 100 / (1 + rs)).fillna(50.0)
-    except Exception:
-        return pd.Series([50.0])
-
-
-def trend_label(df):
-    try:
+        if df is None or len(df) < 50:
+            return "NEUTRAL"
         s50 = df["close"].rolling(50).mean().iloc[-1]
         pr = float(df["close"].iloc[-1])
         if pd.isna(s50):
@@ -328,483 +121,375 @@ def trend_label(df):
         return "NEUTRAL"
 
 
-# =============================================================================
-# EVALUATION
-# =============================================================================
-def _parse_iso(s):
-    try:
-        dt = datetime.datetime.fromisoformat(s)
-        if dt.tzinfo is None:
-            dt = WIB.localize(dt)
-        return dt.astimezone(UTC)
-    except Exception:
-        return None
-
-
-def evaluate_trade(trade, df_m15, max_hours=6.0):
-    entry_dt = _parse_iso(trade.get("time", ""))
-    if entry_dt is None:
-        return ("INVALID", True)
-    if df_m15 is None or df_m15.empty:
-        return (None, False)
-    if isinstance(df_m15.index, pd.DatetimeIndex):
-        sub = df_m15[df_m15.index >= entry_dt]
-    else:
-        sub = df_m15
-    if sub.empty:
-        age = (datetime.datetime.now(UTC) - entry_dt).total_seconds() / 3600
-        return ("DRAW", True) if age > max_hours else (None, False)
-
-    sig = trade["signal"]
-    sl, tp1 = float(trade["sl"]), float(trade["tp1"])
-    for _, row in sub.iterrows():
-        if sig == "BUY":
-            if row["low"] <= sl:
-                return ("LOSS", True)
-            if row["high"] >= tp1:
-                return ("WIN", True)
-        else:
-            if row["high"] >= sl:
-                return ("LOSS", True)
-            if row["low"] <= tp1:
-                return ("WIN", True)
-    age = (datetime.datetime.now(UTC) - entry_dt).total_seconds() / 3600
-    return ("DRAW", True) if age > max_hours else (None, False)
-
-
-def process_evaluated(journal, df_m15, memory, calibrator, meta, tracker):
-    changed = False
-    for t in journal:
-        if t.get("evaluated"):
-            continue
-        res, ch = evaluate_trade(t, df_m15)
-        if not ch:
-            continue
-        t["evaluated"] = True
-        t["result"] = res
-        changed = True
-
-        if res in ("WIN", "LOSS"):
-            pnl_r = 0.0
-            if res == "WIN":
-                try:
-                    risk = abs(t["price"] - t["sl"])
-                    reward = abs(t["tp1"] - t["price"])
-                    pnl_r = reward / risk if risk > 0 else 1.0
-                except Exception:
-                    pnl_r = 1.0
-            else:
-                pnl_r = -1.0
-            t["pnl_r"] = pnl_r
-
-            mid = t.get("memory_id")
-            if mid:
-                memory.update(mid, res, pnl_r)
-
-            regime = t.get("regime", "TRANSITION")
-            meta.update(regime, res == "WIN", pnl_r)
-
-            engine_states = t.get("engine_states", {})
-            for name, st in engine_states.items():
-                sc = st.get("sc", 0)
-                tracker.update(regime, name, sc, t["signal"], res)
-
-            conf = t.get("adjusted_consensus", t.get("consensus", 60)) / 100.0
-            calibrator.accumulate(conf, 1 if res == "WIN" else 0)
-
-    if changed:
-        _save(JOURNAL_FILE, journal)
-    return changed
-
-
-# =============================================================================
-# CHART
-# =============================================================================
-def make_chart(df, entry_data, signal, conf, atr):
-    try:
-        plt.figure(figsize=(11, 6))
-        sub = df.tail(100)
-        x = sub.index if isinstance(sub.index, pd.DatetimeIndex) \
-            else range(len(sub))
-        plt.plot(x, sub["close"].values, color="gold", linewidth=1.5,
-                 label="M15")
-
-        plt.axhspan(entry_data.entry_low, entry_data.entry_high,
-                    color="cyan", alpha=0.25,
-                    label=f"Entry {entry_data.entry_low:.2f}-"
-                          f"{entry_data.entry_high:.2f}")
-        plt.axhline(entry_data.entry_ideal, color="cyan",
-                    linestyle="--", linewidth=1)
-        plt.axhline(entry_data.sl, color="red", linewidth=2,
-                    label=f"SL {entry_data.sl:.2f}")
-        plt.axhline(entry_data.tp1, color="green", linestyle=":",
-                    label=f"TP1 {entry_data.tp1:.2f} ({entry_data.rr_tp1}R)")
-        plt.axhline(entry_data.tp2, color="green", linestyle="--",
-                    label=f"TP2 {entry_data.tp2:.2f} ({entry_data.rr_tp2}R)")
-        plt.axhline(entry_data.tp3, color="green", linestyle="-",
-                    label=f"TP3 {entry_data.tp3:.2f} ({entry_data.rr_tp3}R)")
-
-        plt.title(f"{signal} | conf {conf:.0f}% | "
-                  f"Precision {entry_data.precision_score:.0f} "
-                  f"({entry_data.precision_grade}) | "
-                  f"{entry_data.entry_type}")
-        plt.legend(fontsize=8, loc="best")
-        plt.grid(alpha=0.3)
-        plt.tight_layout()
-        p = os.path.join(CACHE_DIR, "chart.png")
-        plt.savefig(p, dpi=140)
-        plt.close("all")
-        return p
-    except Exception as e:
-        log(f"chart err {e}")
-        try:
-            plt.close("all")
-        except Exception:
-            pass
-        return None
-
-
-# =============================================================================
-# CAPTION
-# =============================================================================
-def compose_precision_caption(signal, entry_data, atr, consensus,
-                               grade, grade_score, regime, anomaly,
-                               mem_stats, debate_res, source, offset,
-                               ai_insight):
-    import html as _html
-    bar_f = int(consensus / 10)
-    bar = "█" * bar_f + "░" * (10 - bar_f)
-    regime_tag = {
-        "TRENDING_UP": "📈 TREND UP", "TRENDING_DOWN": "📉 TREND DOWN",
-        "RANGING": "↔️ RANGING", "VOLATILE": "⚡ VOLATILE",
-        "QUIET": "😴 QUIET", "TRANSITION": "🔄 TRANSITION",
-    }.get(regime.regime.value, "❓")
-    emoji = "🟢" if signal == "BUY" else "🔴"
-
-    mem_line = "—"
-    if mem_stats.get("n", 0) >= 5:
-        mem_line = (f"{mem_stats['n']} case | WR {mem_stats['winrate']:.0f}% "
-                    f"| avg {mem_stats['avg_r']:+.2f}R")
-
-    debate_line = ""
-    if debate_res.get("verdict") and debate_res["verdict"] != "ABSTAIN":
-        de = {"AGREE": "✅", "DISAGREE": "❌"}.get(debate_res["verdict"], "⚪")
-        debate_line = f"\n{de} <b>AI Council:</b> {debate_res['verdict']}"
-        if debate_res.get("notes"):
-            debate_line += (f" — <i>"
-                            f"{_html.escape(debate_res['notes'][:100])}</i>")
-
-    tp_lines = "\n".join([
-        f"  <b>TP{i+1}:</b> <code>{tp:.2f}</code> "
-        f"({rr:.2f}R) <i>{entry_data.tp_reasons[i]}</i>"
-        for i, (tp, rr) in enumerate([
-            (entry_data.tp1, entry_data.rr_tp1),
-            (entry_data.tp2, entry_data.rr_tp2),
-            (entry_data.tp3, entry_data.rr_tp3),
-            (entry_data.tp4, 0.0),
-        ])
-    ])
-
-    off_line = f" | offset {offset:+.2f}" if offset else ""
-    ai_safe = _html.escape(ai_insight[:350]) if ai_insight else "-"
-
-    entry_type_label = {
-        "FVG_FILL": "🎯 FVG Fill",
-        "OB_RETEST": "🎯 Order Block Retest",
-        "STRUCTURE_PULLBACK": "🎯 Structure Pullback",
-    }.get(entry_data.entry_type, "🎯")
-
-    return (
-        f"{emoji} <b>XAUUSD {signal}</b> — Grade <b>{grade}</b>\n"
-        f"<b>Precision: {entry_data.precision_score:.0f}/100 "
-        f"({entry_data.precision_grade})</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📊 Confidence: [{bar}] {consensus:.0f}%\n"
-        f"🌊 Regime: {regime_tag} (conf {regime.confidence:.2f})\n"
-        f"📡 Source: {_html.escape(source)}{off_line}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━\n"
-        f"{entry_type_label}\n"
-        f"<b>Entry Zone:</b> <code>{entry_data.entry_low:.2f} - "
-        f"{entry_data.entry_high:.2f}</code>\n"
-        f"<b>Entry Ideal:</b> <code>{entry_data.entry_ideal:.2f}</code>\n"
-        f"<b>SL:</b> <code>{entry_data.sl:.2f}</code> "
-        f"<i>({entry_data.sl_reason})</i>\n"
-        f"<b>Risk:</b> {entry_data.risk_points:.2f} pts\n"
-        f"━━━━━━━━━━━━━━━━━━━━━\n"
-        f"{tp_lines}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🧠 Memory: {mem_line}\n"
-        f"⚡ Anomaly: {anomaly.score:.2f}"
-        f"{debate_line}\n"
-        f"🤖 <i>{ai_safe}</i>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━\n"
-        f"⏰ {datetime.datetime.now(WIB).strftime('%H:%M WIB | %d-%m')}"
-    )
-
-
-# =============================================================================
-# MAIN
-# =============================================================================
-def main():
-    log("=" * 60)
-    log("XAUUSD AGI ENGINE v31.1 (LEVEL 3) START")
-    log("=" * 60)
-    _ping("start")
-
-    _init_db()
-    journal = _load(JOURNAL_FILE, [])
-    fail = _load(FAIL_FILE, {"count": 0})
-
-    if is_paused() and not FORCE_RUN:
-        log("Paused. Skip.")
-        _ping("paused")
-        return 0
-
-    if GEMINI_API_KEY:
-        log(f"[Gemini] API key present (len={len(GEMINI_API_KEY)})")
-    else:
-        log("[Gemini] ⚠️ No API key")
-
-    if _tp:
-        log(f"[L3] Tuned params loaded: {_tp}")
-
-    try:
-        price, df_m15, df_h1, df_h4, source, offset = get_price_and_data()
-        fail["count"] = 0
-        _save(FAIL_FILE, fail)
-    except Exception as e:
-        fail["count"] = fail.get("count", 0) + 1
-        _save(FAIL_FILE, fail)
-        log(f"Data fetch failed: {e}")
-        if fail["count"] >= 2:
-            send_text(TELEGRAM_BOT_TOKEN,
-                      f"🚨 <b>ALERT</b>: fetch gagal {fail['count']}x", None)
-        _ping("fail_fetch")
-        return 1
-
-    memory = Memory()
-    calibrator = Calibrator()
-    meta = MetaLearner()
-    tracker = EngineTracker()
-
-    process_evaluated(journal, df_m15, memory, calibrator, meta, tracker)
-
-    regime = detect_regime(df_m15)
-    anomaly = detect_anomaly(df_m15)
-    _, mem_stats = memory.query(df_m15, k=20)
-    current_regime = regime.regime.value
-
-    h1_trend = trend_label(df_h1)
-    h4_trend = trend_label(df_h4) if df_h4 is not None else "NEUTRAL"
-    h1_rsi = float(rsi(df_h1).iloc[-1])
-
-    # [L3] Scoring dengan tracker
+def _score_engines(df):
     buy_w = sell_w = 0.0
     states = {}
-    bullish_engines = bearish_engines = 0
-    disabled_engines = []
-
     for name, fn in ENGINES:
         try:
-            sc, w = fn(df_m15)
-            tracker_mult = tracker.get_weight_mult(current_regime, name)
-            if tracker_mult == 0.0:
-                disabled_engines.append(name)
-            effective_w = w * tracker_mult
-            states[name] = {
-                "sc": sc,
-                "weight_used": round(effective_w, 4),
-                "tracker_mult": round(tracker_mult, 3),
-            }
+            sc, w = fn(df)
+            states[name] = {"sc": sc, "weight_used": w}
             if sc > 0:
-                buy_w += effective_w * abs(sc)
-                bullish_engines += 1
+                buy_w += w * abs(sc)
             elif sc < 0:
-                sell_w += effective_w * abs(sc)
-                bearish_engines += 1
-        except Exception as e:
-            states[name] = {"sc": 0, "weight_used": 1.0, "tracker_mult": 1.0}
-            log(f"Engine {name} err: {e}")
+                sell_w += w * abs(sc)
+        except Exception:
+            states[name] = {"sc": 0, "weight_used": 1.0}
+    return buy_w, sell_w, states
 
-    if disabled_engines:
-        log(f"[L3] Disabled in {current_regime}: "
-            f"{', '.join(disabled_engines)}")
 
-    if "BULLISH" in h1_trend:
-        buy_w += 2.5
-    elif "BEARISH" in h1_trend:
-        sell_w += 2.5
+def _simulate_exit(df, entry_idx, signal, entry, sl, tp1, max_bars=24):
+    for i in range(entry_idx + 1, min(entry_idx + 1 + max_bars, len(df))):
+        row = df.iloc[i]
+        if signal == "BUY":
+            if row["low"] <= sl:
+                return (sl, "SL", df.index[i].isoformat())
+            if row["high"] >= tp1:
+                return (tp1, "TP1", df.index[i].isoformat())
+        else:
+            if row["high"] >= sl:
+                return (sl, "SL", df.index[i].isoformat())
+            if row["low"] <= tp1:
+                return (tp1, "TP1", df.index[i].isoformat())
+    last_idx = min(entry_idx + max_bars, len(df) - 1)
+    return (float(df.iloc[last_idx]["close"]), "TIMEOUT",
+            df.index[last_idx].isoformat())
 
-    if df_h4 is not None:
+
+def run_backtest(df_m15, df_h1=None, df_h4=None,
+                  min_confluence=65.0, min_precision=70.0,
+                  min_grade="A", warmup=250, cooldown_bars=4,
+                  max_bars=24, require_mtf=True):
+    result = BacktestResult()
+    if df_m15 is None or len(df_m15) < warmup + 20:
+        return result
+    if df_h1 is None:
+        df_h1 = df_m15
+    if df_h4 is None:
+        df_h4 = df_h1
+
+    last_entry_idx = -10_000
+    i = warmup
+
+    while i < len(df_m15) - 1:
+        if i - last_entry_idx < cooldown_bars:
+            i += 1
+            continue
+
+        window = df_m15.iloc[max(0, i - 250):i + 1]
+        if len(window) < 100:
+            i += 1
+            continue
+
+        try:
+            regime_state = detect_regime(window)
+        except Exception:
+            i += 1
+            continue
+
+        h1_slice = df_h1[df_h1.index <= df_m15.index[i]] \
+            if isinstance(df_h1.index, pd.DatetimeIndex) else df_h1
+        h4_slice = df_h4[df_h4.index <= df_m15.index[i]] \
+            if isinstance(df_h4.index, pd.DatetimeIndex) else df_h4
+        h1_trend = _trend_label(h1_slice)
+        h4_trend = _trend_label(h4_slice)
+
+        buy_w, sell_w, states = _score_engines(window)
+        if "BULLISH" in h1_trend:
+            buy_w += 2.5
+        elif "BEARISH" in h1_trend:
+            sell_w += 2.5
         if "BULLISH" in h4_trend:
             buy_w += 1.0
         elif "BEARISH" in h4_trend:
             sell_w += 1.0
 
-    total_w = buy_w + sell_w
-    if total_w == 0 or buy_w == sell_w:
-        log("Neutral. Skip.")
-        _ping("neutral")
-        return 0
+        total = buy_w + sell_w
+        if total == 0 or buy_w == sell_w:
+            i += 1
+            continue
 
-    consensus = max(buy_w, sell_w) / total_w * 100
-    signal = "BUY" if buy_w > sell_w else "SELL"
+        consensus = max(buy_w, sell_w) / total * 100
+        if consensus < min_confluence:
+            i += 1
+            continue
 
-    penalty = meta.penalty(current_regime)
-    adjusted = max(0, min(100, consensus * penalty))
+        signal = "BUY" if buy_w > sell_w else "SELL"
 
-    log(f"Signal={signal} consensus={consensus:.1f}% "
-        f"adjusted={adjusted:.1f}% regime={current_regime} "
-        f"anomaly={anomaly.score:.2f} bull={bullish_engines} "
-        f"bear={bearish_engines}")
+        if require_mtf:
+            aligned = ((signal == "BUY" and "BULLISH" in h1_trend) or
+                       (signal == "SELL" and "BEARISH" in h1_trend))
+            if not aligned:
+                i += 1
+                continue
 
-    if adjusted < MIN_CONFLUENCE:
-        log(f"Below threshold {MIN_CONFLUENCE}. Skip.")
-        _ping("low_score")
-        return 0
+        atr = _atr(window)
+        try:
+            grade_info = grade_signal(consensus, signal, states,
+                                       h1_trend, h4_trend, atr,
+                                       {"n": 0, "winrate": 50}, 0.0)
+        except Exception:
+            i += 1
+            continue
 
-    if REQUIRE_MTF_ALIGN and not FORCE_RUN:
-        aligned = (
-            (signal == "BUY" and "BULLISH" in h1_trend and
-             ("BULLISH" in h4_trend or h4_trend == "NEUTRAL")) or
-            (signal == "SELL" and "BEARISH" in h1_trend and
-             ("BEARISH" in h4_trend or h4_trend == "NEUTRAL"))
+        if not grade_at_least(grade_info["grade"], min_grade):
+            i += 1
+            continue
+
+        try:
+            entry_data = calculate_precise_entry(
+                window, signal, float(window["close"].iloc[-1]),
+                h4_trend, h1_trend, consensus, atr
+            )
+        except Exception:
+            i += 1
+            continue
+
+        if entry_data.precision_score < min_precision:
+            i += 1
+            continue
+
+        exit_price, reason, exit_time = _simulate_exit(
+            df_m15, i, signal, entry_data.entry_ideal,
+            entry_data.sl, entry_data.tp1, max_bars=max_bars
         )
-        if not aligned:
-            log(f"MTF not aligned: {signal} H1={h1_trend} H4={h4_trend}")
-            _ping("mtf_unaligned")
-            return 0
 
-    if anomaly.is_anomaly and not FORCE_RUN:
-        log(f"Anomaly {anomaly.score:.2f}. Skip.")
-        _ping("anomaly")
-        return 0
+        risk = abs(entry_data.entry_ideal - entry_data.sl)
+        if risk <= 0:
+            i += 1
+            continue
+        if signal == "BUY":
+            pnl_r = (exit_price - entry_data.entry_ideal) / risk
+        else:
+            pnl_r = (entry_data.entry_ideal - exit_price) / risk
 
-    atr_val = calc_atr(df_m15)
-    grade_info = grade_signal(adjusted, signal, states, h1_trend, h4_trend,
-                               atr_val, mem_stats, anomaly.score)
-    log(f"Grade={grade_info['grade']} score={grade_info['score']}")
+        trade = BacktestTrade(
+            entry_time=df_m15.index[i].isoformat(),
+            exit_time=exit_time,
+            signal=signal,
+            entry=round(entry_data.entry_ideal, 2),
+            sl=round(entry_data.sl, 2),
+            tp1=round(entry_data.tp1, 2),
+            exit_price=round(exit_price, 2),
+            exit_reason=reason,
+            pnl_r=round(pnl_r, 4),
+            regime=regime_state.regime.value,
+            grade=grade_info["grade"],
+            precision_score=entry_data.precision_score,
+            consensus=round(consensus, 2),
+            engine_states={k: v["sc"] for k, v in states.items()},
+        )
+        result.trades.append(asdict(trade))
+        last_entry_idx = i
+        i += 1
 
-    if not grade_at_least(grade_info["grade"], MIN_GRADE) and not FORCE_RUN:
-        log(f"Grade below {MIN_GRADE}. Skip.")
-        _ping("low_grade")
-        return 0
+    _finalize(result)
+    return result
 
-    log("Calculating precision entry...")
-    entry_data = calculate_precise_entry(
-        df_m15, signal, price, h4_trend, h1_trend, adjusted, atr_val
-    )
-    log(f"[Precision] {entry_data.precision_grade} "
-        f"({entry_data.precision_score}/100) "
-        f"type={entry_data.entry_type} "
-        f"entry={entry_data.entry_low:.2f}-{entry_data.entry_high:.2f} "
-        f"SL={entry_data.sl:.2f} "
-        f"TP1={entry_data.tp1:.2f} ({entry_data.rr_tp1}R)")
 
-    if entry_data.precision_score < MIN_PRECISION and not FORCE_RUN:
-        log(f"Precision {entry_data.precision_score} < {MIN_PRECISION}. Skip.")
-        _ping("low_precision")
-        return 0
+def _finalize(r):
+    if not r.trades:
+        return
+    rs = np.array([t["pnl_r"] for t in r.trades])
+    r.total_trades = len(rs)
+    r.wins = int((rs > 0).sum())
+    r.losses = int((rs < 0).sum())
+    r.winrate = round(r.wins / r.total_trades * 100, 2)
+    r.total_r = round(float(rs.sum()), 3)
+    r.avg_r = round(float(rs.mean()), 4)
+    r.expectancy = r.avg_r
+    r.avg_precision = round(float(np.mean([t["precision_score"]
+                                             for t in r.trades])), 2)
 
-    if is_duplicate(signal, price, COOLDOWN_MIN) and not FORCE_RUN:
-        log("Duplicate. Skip.")
-        _ping("duplicate")
-        return 0
+    gw = float(rs[rs > 0].sum()) if (rs > 0).any() else 0.0
+    gl = float(abs(rs[rs < 0].sum())) if (rs < 0).any() else 0.0
+    r.profit_factor = round(gw / gl, 3) if gl > 0 else (
+        float("inf") if gw > 0 else 0.0)
 
-    if GEMINI_API_KEY:
-        debate_res = debate(signal, price, adjusted, current_regime,
-                            h1_trend, h4_trend, h1_rsi, atr_val,
-                            mem_stats, anomaly.score, GEMINI_API_KEY)
-        log(f"Debate={debate_res['verdict']} "
-            f"mult={debate_res['confidence_mult']}")
+    eq = np.cumsum(rs)
+    peak = np.maximum.accumulate(eq)
+    dd = peak - eq
+    r.max_dd_r = round(float(dd.max()) if len(dd) else 0.0, 3)
+
+    if rs.std() > 1e-9:
+        r.sharpe = round(float(rs.mean() / rs.std() * np.sqrt(252)), 3)
+
+    rb = {}
+    for t in r.trades:
+        reg = t["regime"]
+        d = rb.setdefault(reg, {"n": 0, "wins": 0, "r_sum": 0.0})
+        d["n"] += 1
+        if t["pnl_r"] > 0:
+            d["wins"] += 1
+        d["r_sum"] += t["pnl_r"]
+    for reg, d in rb.items():
+        d["winrate"] = round(d["wins"] / d["n"] * 100, 1)
+        d["r_sum"] = round(d["r_sum"], 2)
+    r.regime_breakdown = rb
+
+    ea = {}
+    for t in r.trades:
+        signal = t["signal"]
+        result = "WIN" if t["pnl_r"] > 0 else "LOSS"
+        for name, sc in t["engine_states"].items():
+            if sc == 0:
+                continue
+            d = ea.setdefault(name, {"n": 0, "correct": 0})
+            d["n"] += 1
+            was_bull = sc > 0
+            should_bull = (signal == "BUY")
+            if (was_bull == should_bull and result == "WIN") or \
+               (was_bull != should_bull and result == "LOSS"):
+                d["correct"] += 1
+    for name, d in ea.items():
+        d["accuracy"] = round(d["correct"] / d["n"] * 100, 1)
+    r.engine_accuracy = ea
+
+
+def grade_result(r):
+    if r.total_trades < 20:
+        return "INSUFFICIENT"
+    score = 0
+    if r.winrate >= 50: score += 2
+    elif r.winrate >= 42: score += 1
+    if r.profit_factor >= 1.5: score += 3
+    elif r.profit_factor >= 1.2: score += 2
+    elif r.profit_factor >= 1.0: score += 1
+    if r.expectancy > 0.15: score += 2
+    elif r.expectancy > 0: score += 1
+    if r.sharpe >= 1.5: score += 2
+    elif r.sharpe >= 0.8: score += 1
+    if r.max_dd_r < 10: score += 2
+    elif r.max_dd_r < 20: score += 1
+
+    if score >= 10: return "A+++"
+    if score >= 8: return "A++"
+    if score >= 6: return "A"
+    if score >= 4: return "B"
+    if score >= 2: return "C"
+    return "D"
+
+
+def print_report(r):
+    print("\n" + "=" * 65)
+    print("BACKTEST REPORT")
+    print("=" * 65)
+    print(f"Trades        : {r.total_trades}")
+    print(f"Winrate       : {r.winrate}% (W{r.wins}/L{r.losses})")
+    print(f"Total R       : {r.total_r:+.2f}")
+    print(f"Avg R         : {r.avg_r:+.4f}")
+    print(f"Expectancy    : {r.expectancy:+.4f}R")
+    print(f"Profit Factor : {r.profit_factor}")
+    print(f"Max DD        : {r.max_dd_r:.2f}R")
+    print(f"Sharpe        : {r.sharpe}")
+    print(f"Avg Precision : {r.avg_precision}")
+    print(f"\nGRADE: {grade_result(r)}")
+    print("=" * 65)
+
+    if r.regime_breakdown:
+        print("\nPer Regime:")
+        for reg, d in sorted(r.regime_breakdown.items(),
+                             key=lambda x: -x[1]["r_sum"]):
+            print(f"  {reg:16s} n={d['n']:3d} wr={d['winrate']:5.1f}% "
+                  f"R={d['r_sum']:+.2f}")
+
+    if r.engine_accuracy:
+        print("\nPer Engine Accuracy:")
+        for name, d in sorted(r.engine_accuracy.items(),
+                              key=lambda x: -x[1]["accuracy"]):
+            print(f"  {name:22s} acc={d['accuracy']:5.1f}% n={d['n']}")
+
+
+def save_report(r, path):
+    data = asdict(r)
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2, default=str)
+    print(f"\nSaved: {path}")
+
+
+# =============================================================================
+# DATA LOADER (pakai Yahoo langsung, tanpa truncate)
+# =============================================================================
+def load_from_deriv(days=60):
+    """Fetch data Yahoo GC=F tanpa truncate 300 bar."""
+    print(f"Loading {days} days data...")
+
+    # --- M15: Yahoo max 60d untuk 15m ---
+    yf_days = min(days, 55)
+    print(f"  Fetching M15 ({yf_days}d)...")
+    df_m15 = _fetch_yahoo("GC=F", f"{yf_days}d", "15m")
+    if df_m15 is None or len(df_m15) < 500:
+        raise RuntimeError(f"M15 fetch gagal, hanya dapat "
+                            f"{len(df_m15) if df_m15 is not None else 0} bars")
+    print(f"  M15 OK: {len(df_m15)} bars")
+
+    # --- H1: Yahoo max 730d ---
+    print(f"  Fetching H1...")
+    df_h1 = _fetch_yahoo("GC=F", "180d", "1h")
+    if df_h1 is None or len(df_h1) < 100:
+        print("  H1 gagal, pakai M15")
+        df_h1 = df_m15
     else:
-        debate_res = {"verdict": "ABSTAIN", "confidence_mult": 1.0,
-                      "notes": "no_key", "raw": ""}
+        print(f"  H1 OK: {len(df_h1)} bars")
 
-    if debate_res["verdict"] == "DISAGREE" and not FORCE_RUN:
-        log("Debate DISAGREE. Skip.")
-        _ping("debate_disagree")
-        return 0
-
-    mem_id = memory.store(df_m15, regime, signal,
-                           entry_data.entry_ideal, outcome="OPEN",
-                           extra={"grade": grade_info["grade"],
-                                  "precision": entry_data.precision_score})
-    trade = {
-        "time": datetime.datetime.now(WIB).isoformat(),
-        "signal": signal,
-        "price": entry_data.entry_ideal,
-        "entry_low": entry_data.entry_low,
-        "entry_high": entry_data.entry_high,
-        "entry_type": entry_data.entry_type,
-        "sl": entry_data.sl,
-        "tp1": entry_data.tp1,
-        "tp2": entry_data.tp2,
-        "tp3": entry_data.tp3,
-        "tp4": entry_data.tp4,
-        "rr_tp1": entry_data.rr_tp1,
-        "rr_tp2": entry_data.rr_tp2,
-        "rr_tp3": entry_data.rr_tp3,
-        "risk_points": entry_data.risk_points,
-        "consensus": round(consensus, 2),
-        "adjusted_consensus": round(adjusted, 2),
-        "grade": grade_info["grade"],
-        "grade_score": grade_info["score"],
-        "precision_score": entry_data.precision_score,
-        "precision_grade": entry_data.precision_grade,
-        "regime": current_regime,
-        "anomaly_score": anomaly.score,
-        "debate_verdict": debate_res["verdict"],
-        "memory_winrate": mem_stats.get("winrate", 50),
-        "memory_n": mem_stats.get("n", 0),
-        "engine_states": states,
-        "memory_id": mem_id,
-        "source": source,
-        "offset_used": offset,
-        "evaluated": False,
-    }
-    journal.append(trade)
-    if len(journal) > 200:
-        journal = journal[-200:]
-    _save(JOURNAL_FILE, journal)
-    save_signal(signal, entry_data.entry_ideal)
-
-    ai = compose_local_insight(signal, adjusted, current_regime,
-                                h1_trend, h4_trend, mem_stats, anomaly.score)
-
-    caption = compose_precision_caption(
-        signal, entry_data, atr_val, adjusted,
-        grade_info["grade"], grade_info["score"], regime, anomaly,
-        mem_stats, debate_res, source, offset, ai,
-    )
-
-    if disabled_engines:
-        caption += (f"\n🔕 <i>Disabled di {current_regime}: "
-                    f"{', '.join(disabled_engines)}</i>")
-
-    if source == "Yahoo GC=F":
-        caption += (f"\n⚠️ <i>Yahoo delay ~10m. "
-                    f"Verify harga di MT5 sebelum limit order.</i>")
-
-    chart = make_chart(df_m15, entry_data, signal, adjusted, atr_val)
-    if chart and os.path.exists(chart):
-        send_photo(TELEGRAM_BOT_TOKEN, caption, chart)
+    # --- H4: pakai 1d sebagai proxy (Yahoo gak ada 4h) ---
+    print(f"  Fetching H4 (via 1d)...")
+    df_h4 = _fetch_yahoo("GC=F", "2y", "1d")
+    if df_h4 is None or len(df_h4) < 50:
+        print("  H4 gagal, pakai H1")
+        df_h4 = df_h1
     else:
-        send_text(TELEGRAM_BOT_TOKEN, caption, None)
+        print(f"  H4 OK: {len(df_h4)} bars")
 
-    log(f"✅ SENT: {signal} entry={entry_data.entry_ideal:.2f} "
-        f"SL={entry_data.sl:.2f} precision={entry_data.precision_grade}")
+    return df_m15, df_h1, df_h4
 
-    reflect(journal, current_regime, GEMINI_API_KEY, interval=10)
-    _ping("success")
+
+def load_csv(path):
+    df = pd.read_csv(path)
+    dc = next((c for c in df.columns
+               if "date" in c.lower() or "time" in c.lower()), df.columns[0])
+    df["datetime"] = pd.to_datetime(df[dc], utc=True, errors="coerce")
+    df = df.dropna(subset=["datetime"]).set_index("datetime")
+    cols = {c: c.lower() for c in df.columns}
+    df = df.rename(columns=cols)
+    if "volume" not in df.columns:
+        df["volume"] = 100.0
+    return df[["open", "high", "low", "close", "volume"]].sort_index()
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--csv")
+    ap.add_argument("--deriv", action="store_true")
+    ap.add_argument("--days", type=int, default=60)
+    ap.add_argument("--min-score", type=float, default=65.0)
+    ap.add_argument("--min-precision", type=float, default=70.0)
+    ap.add_argument("--min-grade", default="A")
+    ap.add_argument("--out", default="backtest_report.json")
+    ap.add_argument("--no-mtf", action="store_true")
+    args = ap.parse_args()
+
+    if args.csv:
+        df_m15 = load_csv(args.csv)
+        df_h1 = df_m15
+        df_h4 = df_m15
+    elif args.deriv:
+        df_m15, df_h1, df_h4 = load_from_deriv(args.days)
+    else:
+        print("Pakai --csv <path> atau --deriv")
+        return 1
+
+    print(f"Data: {len(df_m15)} bars | "
+          f"{df_m15.index[0]} -> {df_m15.index[-1]}")
+
+    r = run_backtest(df_m15, df_h1, df_h4,
+                      min_confluence=args.min_score,
+                      min_precision=args.min_precision,
+                      min_grade=args.min_grade,
+                      require_mtf=not args.no_mtf)
+    print_report(r)
+    save_report(r, args.out)
     return 0
 
 
 if __name__ == "__main__":
-    try:
-        sys.exit(main())
-    except Exception as e:
-        import traceback
-        log(f"FATAL: {e}")
-        log(traceback.format_exc())
-        sys.exit(1)
+    sys.exit(main())
