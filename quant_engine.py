@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
 =============================================================================
-XAUUSD AGI QUANT ENGINE v31.0 (INSTITUTIONAL GRADE)
+XAUUSD AGI QUANT ENGINE v31.1 (LEVEL 3 - SELF-TUNING)
 =============================================================================
 - 10 institutional engines (BOS, FVG, OB, Liquidity, dll)
-- Precision entry system (limit order di zona, bukan market)
-- Structural SL/TP (bukan ATR multiple)
-- Multi-TF confluence gate
-- AGI layer (regime, memory, calibration, meta)
+- Precision entry system (limit order di zona)
+- Structural SL/TP
+- Engine Tracker: auto-disable engine jelek per regime
+- Auto-Tuner: parameter optimal dari backtest
+- AGI layer: regime, memory, calibration, meta
 - Gemini debate + reflection
 =============================================================================
 """
@@ -31,12 +32,14 @@ import matplotlib.pyplot as plt
 
 from agi_core import (
     detect_regime, detect_anomaly, Memory, Calibrator, MetaLearner,
-    grade_signal, grade_at_least, compose_caption, compose_local_insight,
+    grade_signal, grade_at_least, compose_local_insight,
 )
 from agi_gemini import debate, reflect
 from telegram_utils import send_text, send_photo, is_paused
-from engines import ENGINES, find_swings
+from engines import ENGINES
 from precision_entry import calculate_precise_entry
+from engine_tracker import EngineTracker
+from auto_tuner import load_tuned
 
 # =============================================================================
 WIB = pytz.timezone("Asia/Jakarta")
@@ -48,16 +51,20 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 HEALTHCHECK_URL = os.getenv("HEALTHCHECK_URL", "").strip()
 
 SYMBOL_DERIV = os.getenv("SYMBOL_DERIV", "frxXAUUSD")
-MIN_CONFLUENCE = float(os.getenv("MIN_CONFLUENCE_SCORE", "65"))
-MIN_GRADE = os.getenv("MIN_SIGNAL_GRADE", "A")
-MIN_PRECISION = float(os.getenv("MIN_PRECISION_SCORE", "70"))
+
+# [L3] Load tuned params kalau ada
+_tuned = load_tuned()
+_tp = _tuned.get("params", {})
+
+MIN_CONFLUENCE = float(os.getenv("MIN_CONFLUENCE_SCORE",
+                                  str(_tp.get("min_confluence", 65))))
+MIN_GRADE = os.getenv("MIN_SIGNAL_GRADE", _tp.get("min_grade", "A"))
+MIN_PRECISION = float(os.getenv("MIN_PRECISION_SCORE",
+                                 str(_tp.get("min_precision", 70))))
 COOLDOWN_MIN = int(os.getenv("SIGNAL_COOLDOWN_MINUTES", "60"))
 FORCE_RUN = os.getenv("FORCE_RUN", "false").lower() == "true"
-
-# Wajib: multi-TF alignment untuk sinyal
 REQUIRE_MTF_ALIGN = os.getenv("REQUIRE_MTF_ALIGN", "true").lower() == "true"
 
-# Offset YF -> spot
 YAHOO_OFFSET_DEFAULT = float(os.getenv("YAHOO_OFFSET", "-35.00"))
 OFFSET_SAFETY_MIN = float(os.getenv("YAHOO_OFFSET_MIN", "-10.00"))
 OFFSET_SAFETY_MAX = float(os.getenv("YAHOO_OFFSET_MAX", "-60.00"))
@@ -137,7 +144,7 @@ def save_signal(direction, price):
 
 
 # =============================================================================
-# DATA FEED (sama seperti v30)
+# DATA FEED
 # =============================================================================
 def fetch_deriv(limit=300, gran=900):
     url = "wss://ws.derivws.com/websockets/v3?app_id=1089"
@@ -365,7 +372,7 @@ def evaluate_trade(trade, df_m15, max_hours=6.0):
     return ("DRAW", True) if age > max_hours else (None, False)
 
 
-def process_evaluated(journal, df_m15, memory, calibrator, meta):
+def process_evaluated(journal, df_m15, memory, calibrator, meta, tracker):
     changed = False
     for t in journal:
         if t.get("evaluated"):
@@ -376,6 +383,7 @@ def process_evaluated(journal, df_m15, memory, calibrator, meta):
         t["evaluated"] = True
         t["result"] = res
         changed = True
+
         if res in ("WIN", "LOSS"):
             pnl_r = 0.0
             if res == "WIN":
@@ -388,13 +396,22 @@ def process_evaluated(journal, df_m15, memory, calibrator, meta):
             else:
                 pnl_r = -1.0
             t["pnl_r"] = pnl_r
+
             mid = t.get("memory_id")
             if mid:
                 memory.update(mid, res, pnl_r)
+
             regime = t.get("regime", "TRANSITION")
             meta.update(regime, res == "WIN", pnl_r)
+
+            engine_states = t.get("engine_states", {})
+            for name, st in engine_states.items():
+                sc = st.get("sc", 0)
+                tracker.update(regime, name, sc, t["signal"], res)
+
             conf = t.get("adjusted_consensus", t.get("consensus", 60)) / 100.0
             calibrator.accumulate(conf, 1 if res == "WIN" else 0)
+
     if changed:
         _save(JOURNAL_FILE, journal)
     return changed
@@ -404,7 +421,6 @@ def process_evaluated(journal, df_m15, memory, calibrator, meta):
 # CHART
 # =============================================================================
 def make_chart(df, entry_data, signal, conf, atr):
-    """Chart dengan zona entry FVG/OB + structural SL/TP."""
     try:
         plt.figure(figsize=(11, 6))
         sub = df.tail(100)
@@ -413,14 +429,12 @@ def make_chart(df, entry_data, signal, conf, atr):
         plt.plot(x, sub["close"].values, color="gold", linewidth=1.5,
                  label="M15")
 
-        # Entry zone
         plt.axhspan(entry_data.entry_low, entry_data.entry_high,
                     color="cyan", alpha=0.25,
-                    label=f"Entry {entry_data.entry_low:.2f}-{entry_data.entry_high:.2f}")
+                    label=f"Entry {entry_data.entry_low:.2f}-"
+                          f"{entry_data.entry_high:.2f}")
         plt.axhline(entry_data.entry_ideal, color="cyan",
                     linestyle="--", linewidth=1)
-
-        # SL & TP
         plt.axhline(entry_data.sl, color="red", linewidth=2,
                     label=f"SL {entry_data.sl:.2f}")
         plt.axhline(entry_data.tp1, color="green", linestyle=":",
@@ -451,7 +465,7 @@ def make_chart(df, entry_data, signal, conf, atr):
 
 
 # =============================================================================
-# CAPTION (override untuk precision entry)
+# CAPTION
 # =============================================================================
 def compose_precision_caption(signal, entry_data, atr, consensus,
                                grade, grade_score, regime, anomaly,
@@ -477,7 +491,8 @@ def compose_precision_caption(signal, entry_data, atr, consensus,
         de = {"AGREE": "✅", "DISAGREE": "❌"}.get(debate_res["verdict"], "⚪")
         debate_line = f"\n{de} <b>AI Council:</b> {debate_res['verdict']}"
         if debate_res.get("notes"):
-            debate_line += f" — <i>{_html.escape(debate_res['notes'][:100])}</i>"
+            debate_line += (f" — <i>"
+                            f"{_html.escape(debate_res['notes'][:100])}</i>")
 
     tp_lines = "\n".join([
         f"  <b>TP{i+1}:</b> <code>{tp:.2f}</code> "
@@ -532,7 +547,7 @@ def compose_precision_caption(signal, entry_data, atr, consensus,
 # =============================================================================
 def main():
     log("=" * 60)
-    log("XAUUSD AGI ENGINE v31.0 START")
+    log("XAUUSD AGI ENGINE v31.1 (LEVEL 3) START")
     log("=" * 60)
     _ping("start")
 
@@ -548,7 +563,10 @@ def main():
     if GEMINI_API_KEY:
         log(f"[Gemini] API key present (len={len(GEMINI_API_KEY)})")
     else:
-        log("[Gemini] ⚠️ No API key — debate disabled")
+        log("[Gemini] ⚠️ No API key")
+
+    if _tp:
+        log(f"[L3] Tuned params loaded: {_tp}")
 
     try:
         price, df_m15, df_h1, df_h4, source, offset = get_price_and_data()
@@ -567,36 +585,51 @@ def main():
     memory = Memory()
     calibrator = Calibrator()
     meta = MetaLearner()
-    process_evaluated(journal, df_m15, memory, calibrator, meta)
+    tracker = EngineTracker()
 
-    # Regime + anomaly
+    process_evaluated(journal, df_m15, memory, calibrator, meta, tracker)
+
     regime = detect_regime(df_m15)
     anomaly = detect_anomaly(df_m15)
     _, mem_stats = memory.query(df_m15, k=20)
+    current_regime = regime.regime.value
 
     h1_trend = trend_label(df_h1)
     h4_trend = trend_label(df_h4) if df_h4 is not None else "NEUTRAL"
     h1_rsi = float(rsi(df_h1).iloc[-1])
 
-    # Scoring dari 10 institutional engines
+    # [L3] Scoring dengan tracker
     buy_w = sell_w = 0.0
     states = {}
     bullish_engines = bearish_engines = 0
+    disabled_engines = []
+
     for name, fn in ENGINES:
         try:
             sc, w = fn(df_m15)
-            states[name] = {"sc": sc, "weight_used": w}
+            tracker_mult = tracker.get_weight_mult(current_regime, name)
+            if tracker_mult == 0.0:
+                disabled_engines.append(name)
+            effective_w = w * tracker_mult
+            states[name] = {
+                "sc": sc,
+                "weight_used": round(effective_w, 4),
+                "tracker_mult": round(tracker_mult, 3),
+            }
             if sc > 0:
-                buy_w += w * abs(sc)
+                buy_w += effective_w * abs(sc)
                 bullish_engines += 1
             elif sc < 0:
-                sell_w += w * abs(sc)
+                sell_w += effective_w * abs(sc)
                 bearish_engines += 1
         except Exception as e:
-            states[name] = {"sc": 0, "weight_used": 1.0}
+            states[name] = {"sc": 0, "weight_used": 1.0, "tracker_mult": 1.0}
             log(f"Engine {name} err: {e}")
 
-    # HTF bias
+    if disabled_engines:
+        log(f"[L3] Disabled in {current_regime}: "
+            f"{', '.join(disabled_engines)}")
+
     if "BULLISH" in h1_trend:
         buy_w += 2.5
     elif "BEARISH" in h1_trend:
@@ -617,21 +650,19 @@ def main():
     consensus = max(buy_w, sell_w) / total_w * 100
     signal = "BUY" if buy_w > sell_w else "SELL"
 
-    penalty = meta.penalty(regime.regime.value)
+    penalty = meta.penalty(current_regime)
     adjusted = max(0, min(100, consensus * penalty))
 
     log(f"Signal={signal} consensus={consensus:.1f}% "
-        f"adjusted={adjusted:.1f}% regime={regime.regime.value} "
-        f"anomaly={anomaly.score:.2f} "
-        f"engines_bull={bullish_engines} bear={bearish_engines}")
+        f"adjusted={adjusted:.1f}% regime={current_regime} "
+        f"anomaly={anomaly.score:.2f} bull={bullish_engines} "
+        f"bear={bearish_engines}")
 
-    # Confluence gate
     if adjusted < MIN_CONFLUENCE:
         log(f"Below threshold {MIN_CONFLUENCE}. Skip.")
         _ping("low_score")
         return 0
 
-    # MTF alignment wajib
     if REQUIRE_MTF_ALIGN and not FORCE_RUN:
         aligned = (
             (signal == "BUY" and "BULLISH" in h1_trend and
@@ -640,18 +671,15 @@ def main():
              ("BEARISH" in h4_trend or h4_trend == "NEUTRAL"))
         )
         if not aligned:
-            log(f"MTF not aligned: signal={signal} H1={h1_trend} "
-                f"H4={h4_trend}. Skip.")
+            log(f"MTF not aligned: {signal} H1={h1_trend} H4={h4_trend}")
             _ping("mtf_unaligned")
             return 0
 
-    # Anomaly gate
     if anomaly.is_anomaly and not FORCE_RUN:
         log(f"Anomaly {anomaly.score:.2f}. Skip.")
         _ping("anomaly")
         return 0
 
-    # Grade
     atr_val = calc_atr(df_m15)
     grade_info = grade_signal(adjusted, signal, states, h1_trend, h4_trend,
                                atr_val, mem_stats, anomaly.score)
@@ -662,34 +690,29 @@ def main():
         _ping("low_grade")
         return 0
 
-    # **PRECISION ENTRY**
     log("Calculating precision entry...")
     entry_data = calculate_precise_entry(
         df_m15, signal, price, h4_trend, h1_trend, adjusted, atr_val
     )
     log(f"[Precision] {entry_data.precision_grade} "
-        f"({entry_data.precision_score}/100) | "
-        f"type={entry_data.entry_type} | "
-        f"entry={entry_data.entry_low:.2f}-{entry_data.entry_high:.2f} | "
-        f"SL={entry_data.sl:.2f} | "
-        f"TP1={entry_data.tp1:.2f} ({entry_data.rr_tp1}R) | "
-        f"TP2={entry_data.tp2:.2f} ({entry_data.rr_tp2}R) | "
-        f"TP3={entry_data.tp3:.2f} ({entry_data.rr_tp3}R)")
+        f"({entry_data.precision_score}/100) "
+        f"type={entry_data.entry_type} "
+        f"entry={entry_data.entry_low:.2f}-{entry_data.entry_high:.2f} "
+        f"SL={entry_data.sl:.2f} "
+        f"TP1={entry_data.tp1:.2f} ({entry_data.rr_tp1}R)")
 
     if entry_data.precision_score < MIN_PRECISION and not FORCE_RUN:
         log(f"Precision {entry_data.precision_score} < {MIN_PRECISION}. Skip.")
         _ping("low_precision")
         return 0
 
-    # Anti-spam
     if is_duplicate(signal, price, COOLDOWN_MIN) and not FORCE_RUN:
         log("Duplicate. Skip.")
         _ping("duplicate")
         return 0
 
-    # Gemini debate
     if GEMINI_API_KEY:
-        debate_res = debate(signal, price, adjusted, regime.regime.value,
+        debate_res = debate(signal, price, adjusted, current_regime,
                             h1_trend, h4_trend, h1_rsi, atr_val,
                             mem_stats, anomaly.score, GEMINI_API_KEY)
         log(f"Debate={debate_res['verdict']} "
@@ -703,7 +726,6 @@ def main():
         _ping("debate_disagree")
         return 0
 
-    # Save memory + journal
     mem_id = memory.store(df_m15, regime, signal,
                            entry_data.entry_ideal, outcome="OPEN",
                            extra={"grade": grade_info["grade"],
@@ -730,7 +752,7 @@ def main():
         "grade_score": grade_info["score"],
         "precision_score": entry_data.precision_score,
         "precision_grade": entry_data.precision_grade,
-        "regime": regime.regime.value,
+        "regime": current_regime,
         "anomaly_score": anomaly.score,
         "debate_verdict": debate_res["verdict"],
         "memory_winrate": mem_stats.get("winrate", 50),
@@ -747,7 +769,7 @@ def main():
     _save(JOURNAL_FILE, journal)
     save_signal(signal, entry_data.entry_ideal)
 
-    ai = compose_local_insight(signal, adjusted, regime.regime.value,
+    ai = compose_local_insight(signal, adjusted, current_regime,
                                 h1_trend, h4_trend, mem_stats, anomaly.score)
 
     caption = compose_precision_caption(
@@ -755,6 +777,10 @@ def main():
         grade_info["grade"], grade_info["score"], regime, anomaly,
         mem_stats, debate_res, source, offset, ai,
     )
+
+    if disabled_engines:
+        caption += (f"\n🔕 <i>Disabled di {current_regime}: "
+                    f"{', '.join(disabled_engines)}</i>")
 
     if source == "Yahoo GC=F":
         caption += (f"\n⚠️ <i>Yahoo delay ~10m. "
@@ -769,7 +795,7 @@ def main():
     log(f"✅ SENT: {signal} entry={entry_data.entry_ideal:.2f} "
         f"SL={entry_data.sl:.2f} precision={entry_data.precision_grade}")
 
-    reflect(journal, regime.regime.value, GEMINI_API_KEY, interval=10)
+    reflect(journal, current_regime, GEMINI_API_KEY, interval=10)
     _ping("success")
     return 0
 
