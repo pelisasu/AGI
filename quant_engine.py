@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 """
 =============================================================================
-XAUUSD AGI QUANT ENGINE v31.1 (LEVEL 3 - SELF-TUNING)
+XAUUSD AGI QUANT ENGINE v31.2 (LEVEL 3 - 4 TIER SYSTEM)
 =============================================================================
 - 10 institutional engines (BOS, FVG, OB, Liquidity, dll)
 - Precision entry system (limit order di zona)
 - Structural SL/TP
+- TIERED LOT SIZING:
+    A Super (score >= 90) -> 3.0x (Super Large)
+    A+++    (score >= 85) -> 2.0x (Large)
+    A++     (score >= 75) -> 1.0x (Normal)
+    A       (score >= 65) -> 0.5x (Small)
 - Engine Tracker: auto-disable engine jelek per regime
 - Auto-Tuner: parameter optimal dari backtest
 - AGI layer: regime, memory, calibration, meta
@@ -52,12 +57,11 @@ HEALTHCHECK_URL = os.getenv("HEALTHCHECK_URL", "").strip()
 
 SYMBOL_DERIV = os.getenv("SYMBOL_DERIV", "frxXAUUSD")
 
-# [L3] Load tuned params kalau ada
 _tuned = load_tuned()
 _tp = _tuned.get("params", {})
 
 MIN_CONFLUENCE = float(os.getenv("MIN_CONFLUENCE_SCORE",
-                                  str(_tp.get("min_confluence", 65))))
+                                  str(_tp.get("min_confluence", 60))))
 MIN_GRADE = os.getenv("MIN_SIGNAL_GRADE", _tp.get("min_grade", "A"))
 MIN_PRECISION = float(os.getenv("MIN_PRECISION_SCORE",
                                  str(_tp.get("min_precision", 70))))
@@ -171,7 +175,8 @@ def fetch_deriv(limit=300, gran=900):
                         df[c] = pd.to_numeric(df[c], errors="coerce")
                     df["volume"] = 100.0
                     if "epoch" in df.columns:
-                        df.index = pd.to_datetime(df["epoch"], unit="s", utc=True)
+                        df.index = pd.to_datetime(df["epoch"], unit="s",
+                                                    utc=True)
                     df = df.dropna(subset=["close", "high", "low", "open"])
                     if df.empty:
                         break
@@ -196,9 +201,11 @@ def fetch_yf_gc(period="5d", interval="15m", min_len=50):
             return None, None
         price = float(raw["Close"].iloc[-1])
         raw = raw.reset_index()
-        dc = next((c for c in raw.columns if "date" in c.lower()), raw.columns[0])
+        dc = next((c for c in raw.columns if "date" in c.lower()),
+                  raw.columns[0])
         raw = raw.rename(columns={dc: "datetime", "Close": "close",
-                                   "High": "high", "Low": "low", "Open": "open"})
+                                   "High": "high", "Low": "low",
+                                   "Open": "open"})
         if "Volume" in raw.columns:
             raw["volume"] = pd.to_numeric(raw["Volume"],
                                            errors="coerce").fillna(100.0)
@@ -465,13 +472,31 @@ def make_chart(df, entry_data, signal, conf, atr):
 
 
 # =============================================================================
-# CAPTION
+# CAPTION WITH 4-TIER LOT SIZING
 # =============================================================================
 def compose_precision_caption(signal, entry_data, atr, consensus,
                                grade, grade_score, regime, anomaly,
                                mem_stats, debate_res, source, offset,
                                ai_insight):
     import html as _html
+
+    # =========================================================
+    # 4-TIER LOT SIZING
+    # =========================================================
+    LOT_TIERS = {
+        "A Super": {"mult": 3.0, "label": "🚀 SUPER", "risk": "3.0%",
+                    "note": "Exceptional setup - maximum size"},
+        "A+++":    {"mult": 2.0, "label": "🔴 LARGE", "risk": "2.0%",
+                    "note": "High conviction - full size"},
+        "A++":     {"mult": 1.0, "label": "🟡 NORMAL", "risk": "1.0%",
+                    "note": "Standard setup"},
+        "A":       {"mult": 0.5, "label": "🟢 SMALL", "risk": "0.5%",
+                    "note": "Probing - reduce size"},
+        "B":       {"mult": 0.0, "label": "⚫ SKIP", "risk": "0%",
+                    "note": "Below threshold"},
+    }
+    tier = LOT_TIERS.get(grade, LOT_TIERS["A"])
+
     bar_f = int(consensus / 10)
     bar = "█" * bar_f + "░" * (10 - bar_f)
     regime_tag = {
@@ -480,6 +505,11 @@ def compose_precision_caption(signal, entry_data, atr, consensus,
         "QUIET": "😴 QUIET", "TRANSITION": "🔄 TRANSITION",
     }.get(regime.regime.value, "❓")
     emoji = "🟢" if signal == "BUY" else "🔴"
+
+    # Highlight untuk A Super
+    super_banner = ""
+    if grade == "A Super":
+        super_banner = "\n🔥🔥🔥 <b>EXCEPTIONAL SIGNAL</b> 🔥🔥🔥"
 
     mem_line = "—"
     if mem_stats.get("n", 0) >= 5:
@@ -515,9 +545,14 @@ def compose_precision_caption(signal, entry_data, atr, consensus,
     }.get(entry_data.entry_type, "🎯")
 
     return (
-        f"{emoji} <b>XAUUSD {signal}</b> — Grade <b>{grade}</b>\n"
+        f"{emoji} <b>XAUUSD {signal}</b> — Grade <b>{grade}</b>"
+        f"{super_banner}\n"
         f"<b>Precision: {entry_data.precision_score:.0f}/100 "
         f"({entry_data.precision_grade})</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"💰 <b>LOT TIER: {tier['label']}</b> ({tier['mult']}x)\n"
+        f"⚠️ <b>Risk per trade:</b> {tier['risk']} equity\n"
+        f"📝 <i>{tier['note']}</i>\n"
         f"━━━━━━━━━━━━━━━━━━━━━\n"
         f"📊 Confidence: [{bar}] {consensus:.0f}%\n"
         f"🌊 Regime: {regime_tag} (conf {regime.confidence:.2f})\n"
@@ -547,7 +582,7 @@ def compose_precision_caption(signal, entry_data, atr, consensus,
 # =============================================================================
 def main():
     log("=" * 60)
-    log("XAUUSD AGI ENGINE v31.1 (LEVEL 3) START")
+    log("XAUUSD AGI ENGINE v31.2 (4-TIER) START")
     log("=" * 60)
     _ping("start")
 
@@ -598,7 +633,6 @@ def main():
     h4_trend = trend_label(df_h4) if df_h4 is not None else "NEUTRAL"
     h1_rsi = float(rsi(df_h1).iloc[-1])
 
-    # [L3] Scoring dengan tracker
     buy_w = sell_w = 0.0
     states = {}
     bullish_engines = bearish_engines = 0
@@ -689,6 +723,17 @@ def main():
         log(f"Grade below {MIN_GRADE}. Skip.")
         _ping("low_grade")
         return 0
+
+    # =========================================================================
+    # [NEW] A SUPER UPGRADE
+    # =========================================================================
+    # Kalau Grade A+++ DAN score >= 90 -> upgrade ke A Super (3x lot)
+    if grade_info["grade"] == "A+++" and grade_info["score"] >= 90:
+        original_grade = grade_info["grade"]
+        original_score = grade_info["score"]
+        grade_info["grade"] = "A Super"
+        log(f"🔥 UPGRADE: {original_grade} (score {original_score}) "
+            f"-> A Super (max lot 3x)")
 
     log("Calculating precision entry...")
     entry_data = calculate_precise_entry(
@@ -793,7 +838,8 @@ def main():
         send_text(TELEGRAM_BOT_TOKEN, caption, None)
 
     log(f"✅ SENT: {signal} entry={entry_data.entry_ideal:.2f} "
-        f"SL={entry_data.sl:.2f} precision={entry_data.precision_grade}")
+        f"SL={entry_data.sl:.2f} grade={grade_info['grade']} "
+        f"precision={entry_data.precision_grade}")
 
     reflect(journal, current_regime, GEMINI_API_KEY, interval=10)
     _ping("success")
