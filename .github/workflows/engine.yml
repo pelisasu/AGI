@@ -1,57 +1,50 @@
-name: Quant Engine
+name: AGI Main
 
 on:
   schedule:
-    # Setiap 15 menit
     - cron: '*/15 * * * *'
   workflow_dispatch:
 
 concurrency:
-  group: quant-engine
+  group: agi-main
   cancel-in-progress: false
 
 jobs:
-  run:
+  engine:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 12
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
 
-      - name: Install dependencies
+      - name: Install deps
         run: |
-          python -m pip install --upgrade pip
+          pip install --upgrade pip
           pip install -r requirements.txt
 
       - name: Restore state
         uses: actions/cache@v4
         with:
           path: .state_cache
-          key: state-${{ github.run_id }}
+          key: agi-state
           restore-keys: |
-            state-
+            agi-state
 
       - name: Run engine
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          HEALTHCHECK_URL: ${{ secrets.HEALTHCHECK_URL }}
-          MIN_CONFLUENCE_SCORE: '60'
-          MIN_SIGNAL_GRADE: 'A'
-          SIGNAL_COOLDOWN_MINUTES: '60'
         run: python quant_engine.py
 
-      - name: Save state (unique)
+      - name: Save state
         if: always()
         uses: actions/cache@v4
         with:
           path: .state_cache
-          key: state-${{ github.run_id }}-${{ github.run_attempt }}
+          key: agi-state
