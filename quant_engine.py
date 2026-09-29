@@ -1,7 +1,18 @@
 #!/usr/bin/env python3
 """
-XAUUSD AGI QUANT ENGINE v30
-Main pipeline. Cuma butuh TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, GEMINI_API_KEY.
+=============================================================================
+XAUUSD AGI QUANT ENGINE v30.2 (FINAL)
+=============================================================================
+Cuma butuh 3 secrets: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, GEMINI_API_KEY.
+=================================================================
+PATCH TERBARU:
+ [v30.2] Offset YF default -35.00 (data aktual 29 Sep 2026)
+         Range clamp -10 s/d -60 (contango wajar)
+ [v30.2] QUIET regime guard: skip trend signal di pasar ranging lemah
+ [v30.2] Yahoo delay warning di caption + journal
+ [v30.2] Gemini debug logging (biar ketahuan kalau API key gagal)
+ [v30.2] Simpan source + offset_used di journal untuk audit trail
+=============================================================================
 """
 
 import os
@@ -26,9 +37,11 @@ from agi_core import (
     detect_regime, detect_anomaly, Memory, Calibrator, MetaLearner,
     grade_signal, grade_at_least, compose_caption, compose_local_insight,
 )
-from agi_gemini import debate, reflect, get_last_reflection, build_weekly_report, format_weekly
+from agi_gemini import debate, reflect, get_last_reflection
 from telegram_utils import send_text, send_photo, is_paused
 
+# =============================================================================
+# CONFIG
 # =============================================================================
 WIB = pytz.timezone("Asia/Jakarta")
 UTC = pytz.UTC
@@ -43,6 +56,15 @@ MIN_CONFLUENCE = float(os.getenv("MIN_CONFLUENCE_SCORE", "60"))
 MIN_GRADE = os.getenv("MIN_SIGNAL_GRADE", "A")
 COOLDOWN_MIN = int(os.getenv("SIGNAL_COOLDOWN_MINUTES", "60"))
 FORCE_RUN = os.getenv("FORCE_RUN", "false").lower() == "true"
+
+# -----------------------------------------------------------------------------
+# OFFSET (YF GC=F -> XAUUSD Spot)
+# -----------------------------------------------------------------------------
+# Data 29 Sep 2026: GC=F 4159.20, Spot ~4124.20 -> spread ~35.00
+# Range historis wajar: 10 (tipis) s/d 60 (contango lebar)
+YAHOO_OFFSET_DEFAULT = float(os.getenv("YAHOO_OFFSET", "-35.00"))
+OFFSET_SAFETY_MIN = float(os.getenv("YAHOO_OFFSET_MIN", "-10.00"))   # batas atas (paling kecil)
+OFFSET_SAFETY_MAX = float(os.getenv("YAHOO_OFFSET_MAX", "-60.00"))   # batas bawah (paling besar)
 
 CACHE_DIR = ".state_cache"
 os.makedirs(CACHE_DIR, exist_ok=True)
@@ -68,6 +90,14 @@ def _save(p, d):
     with open(tmp, "w") as f:
         json.dump(d, f, indent=2, default=str)
     os.replace(tmp, p)
+
+
+def _ping(status: str):
+    if HEALTHCHECK_URL:
+        try:
+            requests.get(f"{HEALTHCHECK_URL}?status={status}", timeout=5)
+        except Exception:
+            pass
 
 
 # =============================================================================
@@ -105,7 +135,8 @@ def save_signal(direction, price):
     with closing(sqlite3.connect(DB_FILE)) as c:
         c.execute("INSERT INTO signals (ts, direction, price, zone, status) "
                   "VALUES (?,?,?,?,?)",
-                  (time.time(), direction, float(price), _price_zone(price), "ACTIVE"))
+                  (time.time(), direction, float(price),
+                   _price_zone(price), "ACTIVE"))
         c.commit()
 
 
@@ -165,15 +196,25 @@ def fetch_yf_gc(period="5d", interval="15m", min_len=50):
         dc = next((c for c in raw.columns if "date" in c.lower()), raw.columns[0])
         raw = raw.rename(columns={dc: "datetime", "Close": "close",
                                    "High": "high", "Low": "low", "Open": "open"})
-        raw["volume"] = pd.to_numeric(raw.get("Volume", 100.0),
-                                       errors="coerce").fillna(100.0) \
-            if "Volume" in raw else 100.0
-        raw["datetime"] = pd.to_datetime(raw["datetime"], utc=True, errors="coerce")
+        if "Volume" in raw.columns:
+            raw["volume"] = pd.to_numeric(raw["Volume"],
+                                           errors="coerce").fillna(100.0)
+        else:
+            raw["volume"] = 100.0
+        raw["datetime"] = pd.to_datetime(raw["datetime"], utc=True,
+                                          errors="coerce")
         raw = raw.dropna(subset=["datetime", "close", "high", "low", "open"])
         raw = raw.set_index("datetime")
         return raw[["open", "high", "low", "close", "volume"]].tail(300), price
     except Exception:
         return None, None
+
+
+def _clamp_offset(offset: float) -> float:
+    """Offset harus negatif (YF > spot) dan di dalam range wajar."""
+    if offset > 0:
+        offset = -abs(offset)
+    return max(OFFSET_SAFETY_MAX, min(OFFSET_SAFETY_MIN, offset))
 
 
 def get_price_and_data():
@@ -190,7 +231,7 @@ def get_price_and_data():
         try:
             offset = float(os.getenv("DERIV_OFFSET", "0"))
         except Exception:
-            pass
+            offset = 0.0
 
     if raw_price is None:
         log("Trying Yahoo GC=F...")
@@ -199,10 +240,10 @@ def get_price_and_data():
             raw_price = p
             source = "Yahoo GC=F"
             df_m15 = df_yf
-            try:
-                offset = float(os.getenv("YAHOO_OFFSET", "-41.50"))
-            except Exception:
-                offset = -41.50
+            offset = _clamp_offset(YAHOO_OFFSET_DEFAULT)
+            log(f"[Offset] YF default={YAHOO_OFFSET_DEFAULT:+.2f} "
+                f"clamped={offset:+.2f} "
+                f"(range {OFFSET_SAFETY_MIN:+.2f}..{OFFSET_SAFETY_MAX:+.2f})")
 
     if raw_price is None or df_m15 is None or df_m15.empty:
         raise RuntimeError("All feeds failed")
@@ -213,14 +254,15 @@ def get_price_and_data():
         pass
 
     final = raw_price + offset
-    # Apply offset to df
     if offset != 0:
         df_m15 = df_m15.copy()
         for c in ("open", "high", "low", "close"):
             df_m15[c] = df_m15[c].astype(float) + offset
 
-    log(f"Source={source} raw={raw_price:.2f} offset={offset:+.2f} final={final:.2f}")
+    log(f"Source={source} raw={raw_price:.2f} offset={offset:+.2f} "
+        f"final={final:.2f}")
 
+    # H1
     df_h1, _ = fetch_deriv(200, 3600)
     if df_h1 is None:
         df_h1, _ = fetch_yf_gc("60d", "1h", min_len=100)
@@ -231,6 +273,7 @@ def get_price_and_data():
     if df_h1 is None:
         df_h1 = df_m15
 
+    # H4
     df_h4, _ = fetch_deriv(200, 14400)
     if df_h4 is None:
         df_h4, _ = fetch_yf_gc("1y", "1d", min_len=50)
@@ -250,8 +293,8 @@ def calc_atr(df, p=14):
         if df is None or len(df) < p + 1:
             return 8.0
         h, l, c = df["high"], df["low"], df["close"]
-        tr = pd.concat([h - l, (h - c.shift()).abs(), (l - c.shift()).abs()],
-                       axis=1).max(axis=1)
+        tr = pd.concat([h - l, (h - c.shift()).abs(),
+                        (l - c.shift()).abs()], axis=1).max(axis=1)
         v = tr.rolling(p).mean().iloc[-1]
         return float(v) if not pd.isna(v) and v > 0 else 8.0
     except Exception:
@@ -436,7 +479,10 @@ def evaluate_trade(trade, df_m15, max_hours=6.0):
         return ("INVALID", True)
     if df_m15 is None or df_m15.empty:
         return (None, False)
-    sub = df_m15[df_m15.index >= entry_dt] if isinstance(df_m15.index, pd.DatetimeIndex) else df_m15
+    if isinstance(df_m15.index, pd.DatetimeIndex):
+        sub = df_m15[df_m15.index >= entry_dt]
+    else:
+        sub = df_m15
     if sub.empty:
         age = (datetime.datetime.now(UTC) - entry_dt).total_seconds() / 3600
         return ("DRAW", True) if age > max_hours else (None, False)
@@ -471,7 +517,7 @@ def process_evaluated(journal, df_m15, memory, calibrator, meta):
         changed = True
 
         if res in ("WIN", "LOSS"):
-            pnl_r = 0
+            pnl_r = 0.0
             if res == "WIN":
                 try:
                     risk = abs(t["price"] - t["sl"])
@@ -483,16 +529,13 @@ def process_evaluated(journal, df_m15, memory, calibrator, meta):
                 pnl_r = -1.0
             t["pnl_r"] = pnl_r
 
-            # update memory
             mid = t.get("memory_id")
             if mid:
                 memory.update(mid, res, pnl_r)
 
-            # update meta
             regime = t.get("regime", "TRANSITION")
             meta.update(regime, res == "WIN", pnl_r)
 
-            # accumulate calibration
             conf = t.get("adjusted_consensus", t.get("consensus", 60)) / 100.0
             calibrator.accumulate(conf, 1 if res == "WIN" else 0)
 
@@ -508,8 +551,10 @@ def make_chart(df, entry, sl, tps, signal, conf, atr):
     try:
         plt.figure(figsize=(10, 6))
         sub = df.tail(80)
-        x = sub.index if isinstance(sub.index, pd.DatetimeIndex) else range(len(sub))
-        plt.plot(x, sub["close"].values, color="gold", linewidth=1.5, label="M15")
+        x = sub.index if isinstance(sub.index, pd.DatetimeIndex) \
+            else range(len(sub))
+        plt.plot(x, sub["close"].values, color="gold", linewidth=1.5,
+                 label="M15")
         plt.axhline(entry, color="cyan", label=f"Entry {entry:.2f}")
         plt.axhline(sl, color="red", label=f"SL {sl:.2f}")
         plt.axhline(tps[0], color="green", linestyle=":", label="TP1")
@@ -524,6 +569,10 @@ def make_chart(df, entry, sl, tps, signal, conf, atr):
         return p
     except Exception as e:
         log(f"chart err {e}")
+        try:
+            plt.close("all")
+        except Exception:
+            pass
         return None
 
 
@@ -532,23 +581,25 @@ def make_chart(df, entry, sl, tps, signal, conf, atr):
 # =============================================================================
 def main():
     log("=" * 60)
-    log("XAUUSD AGI ENGINE v30 START")
+    log("XAUUSD AGI ENGINE v30.2 START")
     log("=" * 60)
 
-    if HEALTHCHECK_URL:
-        try:
-            requests.get(f"{HEALTHCHECK_URL}?status=start", timeout=5)
-        except Exception:
-            pass
+    _ping("start")
 
     _init_db()
     journal = _load(JOURNAL_FILE, [])
     fail = _load(FAIL_FILE, {"count": 0})
 
-    # Pause check
     if is_paused() and not FORCE_RUN:
         log("Paused via /pause. Skip.")
+        _ping("paused")
         return 0
+
+    # Gemini API key check
+    if GEMINI_API_KEY:
+        log(f"[Gemini] API key present (len={len(GEMINI_API_KEY)})")
+    else:
+        log("[Gemini] ⚠️ API key MISSING — debate/reflection disabled")
 
     # Fetch data
     try:
@@ -560,30 +611,27 @@ def main():
         _save(FAIL_FILE, fail)
         log(f"Data fetch failed: {e}")
         if fail["count"] >= 2:
-            send_text(TELEGRAM_BOT_TOKEN, f"🚨 <b>ALERT</b>: data fetch gagal {fail['count']}x", None)
+            send_text(TELEGRAM_BOT_TOKEN,
+                      f"🚨 <b>ALERT</b>: data fetch gagal {fail['count']}x",
+                      None)
+        _ping("fail_fetch")
         return 1
 
-    # Init AGI components
     memory = Memory()
     calibrator = Calibrator()
     meta = MetaLearner()
 
-    # Evaluate past trades first
     process_evaluated(journal, df_m15, memory, calibrator, meta)
 
-    # Regime + anomaly
     regime = detect_regime(df_m15)
     anomaly = detect_anomaly(df_m15)
-
-    # Memory query
     _, mem_stats = memory.query(df_m15, k=20)
 
-    # H1/H4 trends
     h1_trend = trend_label(df_h1)
     h4_trend = trend_label(df_h4) if df_h4 is not None else "NEUTRAL"
     h1_rsi = float(rsi(df_h1).iloc[-1])
 
-    # Engine scoring
+    # Scoring
     buy_w = sell_w = 0.0
     states = {}
     for name, fn in ENGINES:
@@ -611,52 +659,71 @@ def main():
     total_w = buy_w + sell_w
     if total_w == 0 or buy_w == sell_w:
         log("Neutral market. Skip.")
+        _ping("neutral")
         return 0
 
     consensus = max(buy_w, sell_w) / total_w * 100
     signal = "BUY" if buy_w > sell_w else "SELL"
 
-    # Meta penalty
     penalty = meta.penalty(regime.regime.value)
     adjusted = consensus * penalty
     adjusted = max(0, min(100, adjusted))
 
-    log(f"Signal={signal} consensus={consensus:.1f}% adjusted={adjusted:.1f}% "
-        f"regime={regime.regime.value} anomaly={anomaly.score:.2f}")
+    log(f"Signal={signal} consensus={consensus:.1f}% "
+        f"adjusted={adjusted:.1f}% regime={regime.regime.value} "
+        f"anomaly={anomaly.score:.2f}")
 
     if adjusted < MIN_CONFLUENCE:
         log(f"Below threshold {MIN_CONFLUENCE}. Skip.")
+        _ping("low_score")
         return 0
 
-    # Grade
     grade_info = grade_signal(adjusted, signal, states, h1_trend, h4_trend,
                                calc_atr(df_m15), mem_stats, anomaly.score)
     log(f"Grade={grade_info['grade']} score={grade_info['score']}")
 
+    # QUIET regime guard
+    if (regime.regime.value == "QUIET"
+            and grade_info["grade"] in ("A", "B", "C", "D")
+            and not FORCE_RUN):
+        log(f"QUIET regime + grade {grade_info['grade']} -> skip")
+        _ping("quiet_low_grade")
+        return 0
+
     if not grade_at_least(grade_info["grade"], MIN_GRADE) and not FORCE_RUN:
         log(f"Grade below {MIN_GRADE}. Skip.")
+        _ping("low_grade")
         return 0
 
     if anomaly.is_anomaly and not FORCE_RUN:
         log(f"Anomaly {anomaly.score:.2f} too high. Skip.")
+        _ping("anomaly_high")
         return 0
 
-    # Anti-spam
     if is_duplicate(signal, price, COOLDOWN_MIN) and not FORCE_RUN:
         log("Duplicate signal. Skip.")
+        _ping("duplicate")
         return 0
 
     # Gemini debate
-    debate_res = debate(signal, price, adjusted, regime.regime.value,
-                        h1_trend, h4_trend, h1_rsi, calc_atr(df_m15),
-                        mem_stats, anomaly.score, GEMINI_API_KEY)
-    log(f"Debate={debate_res['verdict']} mult={debate_res['confidence_mult']}")
+    if GEMINI_API_KEY:
+        debate_res = debate(signal, price, adjusted, regime.regime.value,
+                            h1_trend, h4_trend, h1_rsi, calc_atr(df_m15),
+                            mem_stats, anomaly.score, GEMINI_API_KEY)
+        log(f"Debate verdict={debate_res['verdict']} "
+            f"mult={debate_res['confidence_mult']} "
+            f"notes={debate_res.get('notes', '')[:60]}")
+    else:
+        debate_res = {"verdict": "ABSTAIN", "confidence_mult": 1.0,
+                      "notes": "no_api_key", "raw": ""}
+        log("[Gemini] Skipped — no API key")
 
     adjusted *= debate_res["confidence_mult"]
     adjusted = max(0, min(100, adjusted))
 
     if debate_res["verdict"] == "DISAGREE" and not FORCE_RUN:
         log("AI Council DISAGREE. Skip.")
+        _ping("debate_disagree")
         return 0
 
     # SL/TP
@@ -673,14 +740,15 @@ def main():
         sl = entry + sl_base
         tps = [entry - sl_base * m for m in (1.3, 2.2, 3.5, 5.0)]
 
-    # Save to memory + journal
+    # Save memory + journal
     mem_id = memory.store(df_m15, regime, signal, entry, outcome="OPEN",
                            extra={"grade": grade_info["grade"]})
     trade = {
         "time": datetime.datetime.now(WIB).isoformat(),
         "signal": signal, "price": float(entry),
         "sl": round(sl, 2), "tp1": round(tps[0], 2),
-        "tp2": round(tps[1], 2), "tp3": round(tps[2], 2), "tp4": round(tps[3], 2),
+        "tp2": round(tps[1], 2), "tp3": round(tps[2], 2),
+        "tp4": round(tps[3], 2),
         "consensus": round(consensus, 2),
         "adjusted_consensus": round(adjusted, 2),
         "grade": grade_info["grade"], "grade_score": grade_info["score"],
@@ -691,6 +759,8 @@ def main():
         "memory_n": mem_stats.get("n", 0),
         "engine_states": states,
         "memory_id": mem_id,
+        "source": source,
+        "offset_used": offset,
         "evaluated": False,
     }
     journal.append(trade)
@@ -699,7 +769,7 @@ def main():
     _save(JOURNAL_FILE, journal)
     save_signal(signal, entry)
 
-    # AI insight (local, hemat kuota)
+    # AI insight (local)
     ai = compose_local_insight(signal, adjusted, regime.regime.value,
                                 h1_trend, h4_trend, mem_stats, anomaly.score)
 
@@ -713,6 +783,11 @@ def main():
         offset=offset, ai_insight=ai,
     )
 
+    # Yahoo delay warning
+    if source == "Yahoo GC=F":
+        caption += (f"\n⚠️ <i>Yahoo data delay ~10m. "
+                    f"Offset={offset:+.2f}. Verify sebelum entry.</i>")
+
     # Chart + send
     chart = make_chart(df_m15, entry, sl, tps, signal, adjusted, atr)
     if chart and os.path.exists(chart):
@@ -720,18 +795,15 @@ def main():
     else:
         send_text(TELEGRAM_BOT_TOKEN, caption, None)
 
-    log(f"✅ SIGNAL SENT: {signal} @ {entry:.2f} ({adjusted:.0f}%) grade {grade_info['grade']}")
+    log(f"✅ SIGNAL SENT: {signal} @ {entry:.2f} ({adjusted:.0f}%) "
+        f"grade {grade_info['grade']}")
 
-    # Reflect every 10 trades
+    # Reflection every 10 trades
     refl = reflect(journal, regime.regime.value, GEMINI_API_KEY, interval=10)
     if refl:
         log("Reflection updated.")
 
-    if HEALTHCHECK_URL:
-        try:
-            requests.get(f"{HEALTHCHECK_URL}?status=success", timeout=5)
-        except Exception:
-            pass
+    _ping("success")
     return 0
 
 
