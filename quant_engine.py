@@ -1,17 +1,14 @@
 #!/usr/bin/env python3
 """
 =============================================================================
-XAUUSD AGI QUANT ENGINE v30.2 (FINAL)
+XAUUSD AGI QUANT ENGINE v31.0 (INSTITUTIONAL GRADE)
 =============================================================================
-Cuma butuh 3 secrets: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, GEMINI_API_KEY.
-=================================================================
-PATCH TERBARU:
- [v30.2] Offset YF default -35.00 (data aktual 29 Sep 2026)
-         Range clamp -10 s/d -60 (contango wajar)
- [v30.2] QUIET regime guard: skip trend signal di pasar ranging lemah
- [v30.2] Yahoo delay warning di caption + journal
- [v30.2] Gemini debug logging (biar ketahuan kalau API key gagal)
- [v30.2] Simpan source + offset_used di journal untuk audit trail
+- 10 institutional engines (BOS, FVG, OB, Liquidity, dll)
+- Precision entry system (limit order di zona, bukan market)
+- Structural SL/TP (bukan ATR multiple)
+- Multi-TF confluence gate
+- AGI layer (regime, memory, calibration, meta)
+- Gemini debate + reflection
 =============================================================================
 """
 
@@ -22,7 +19,6 @@ import time
 import sqlite3
 import datetime
 from contextlib import closing
-from datetime import timedelta
 import pytz
 import numpy as np
 import pandas as pd
@@ -37,11 +33,11 @@ from agi_core import (
     detect_regime, detect_anomaly, Memory, Calibrator, MetaLearner,
     grade_signal, grade_at_least, compose_caption, compose_local_insight,
 )
-from agi_gemini import debate, reflect, get_last_reflection
+from agi_gemini import debate, reflect
 from telegram_utils import send_text, send_photo, is_paused
+from engines import ENGINES, find_swings
+from precision_entry import calculate_precise_entry
 
-# =============================================================================
-# CONFIG
 # =============================================================================
 WIB = pytz.timezone("Asia/Jakarta")
 UTC = pytz.UTC
@@ -52,19 +48,19 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 HEALTHCHECK_URL = os.getenv("HEALTHCHECK_URL", "").strip()
 
 SYMBOL_DERIV = os.getenv("SYMBOL_DERIV", "frxXAUUSD")
-MIN_CONFLUENCE = float(os.getenv("MIN_CONFLUENCE_SCORE", "60"))
+MIN_CONFLUENCE = float(os.getenv("MIN_CONFLUENCE_SCORE", "65"))
 MIN_GRADE = os.getenv("MIN_SIGNAL_GRADE", "A")
+MIN_PRECISION = float(os.getenv("MIN_PRECISION_SCORE", "70"))
 COOLDOWN_MIN = int(os.getenv("SIGNAL_COOLDOWN_MINUTES", "60"))
 FORCE_RUN = os.getenv("FORCE_RUN", "false").lower() == "true"
 
-# -----------------------------------------------------------------------------
-# OFFSET (YF GC=F -> XAUUSD Spot)
-# -----------------------------------------------------------------------------
-# Data 29 Sep 2026: GC=F 4159.20, Spot ~4124.20 -> spread ~35.00
-# Range historis wajar: 10 (tipis) s/d 60 (contango lebar)
+# Wajib: multi-TF alignment untuk sinyal
+REQUIRE_MTF_ALIGN = os.getenv("REQUIRE_MTF_ALIGN", "true").lower() == "true"
+
+# Offset YF -> spot
 YAHOO_OFFSET_DEFAULT = float(os.getenv("YAHOO_OFFSET", "-35.00"))
-OFFSET_SAFETY_MIN = float(os.getenv("YAHOO_OFFSET_MIN", "-10.00"))   # batas atas (paling kecil)
-OFFSET_SAFETY_MAX = float(os.getenv("YAHOO_OFFSET_MAX", "-60.00"))   # batas bawah (paling besar)
+OFFSET_SAFETY_MIN = float(os.getenv("YAHOO_OFFSET_MIN", "-10.00"))
+OFFSET_SAFETY_MAX = float(os.getenv("YAHOO_OFFSET_MAX", "-60.00"))
 
 CACHE_DIR = ".state_cache"
 os.makedirs(CACHE_DIR, exist_ok=True)
@@ -92,7 +88,7 @@ def _save(p, d):
     os.replace(tmp, p)
 
 
-def _ping(status: str):
+def _ping(status):
     if HEALTHCHECK_URL:
         try:
             requests.get(f"{HEALTHCHECK_URL}?status={status}", timeout=5)
@@ -141,7 +137,7 @@ def save_signal(direction, price):
 
 
 # =============================================================================
-# DATA FEED
+# DATA FEED (sama seperti v30)
 # =============================================================================
 def fetch_deriv(limit=300, gran=900):
     url = "wss://ws.derivws.com/websockets/v3?app_id=1089"
@@ -210,8 +206,7 @@ def fetch_yf_gc(period="5d", interval="15m", min_len=50):
         return None, None
 
 
-def _clamp_offset(offset: float) -> float:
-    """Offset harus negatif (YF > spot) dan di dalam range wajar."""
+def _clamp_offset(offset):
     if offset > 0:
         offset = -abs(offset)
     return max(OFFSET_SAFETY_MAX, min(OFFSET_SAFETY_MIN, offset))
@@ -241,9 +236,8 @@ def get_price_and_data():
             source = "Yahoo GC=F"
             df_m15 = df_yf
             offset = _clamp_offset(YAHOO_OFFSET_DEFAULT)
-            log(f"[Offset] YF default={YAHOO_OFFSET_DEFAULT:+.2f} "
-                f"clamped={offset:+.2f} "
-                f"(range {OFFSET_SAFETY_MIN:+.2f}..{OFFSET_SAFETY_MAX:+.2f})")
+            log(f"[Offset] default={YAHOO_OFFSET_DEFAULT:+.2f} "
+                f"clamped={offset:+.2f}")
 
     if raw_price is None or df_m15 is None or df_m15.empty:
         raise RuntimeError("All feeds failed")
@@ -262,7 +256,6 @@ def get_price_and_data():
     log(f"Source={source} raw={raw_price:.2f} offset={offset:+.2f} "
         f"final={final:.2f}")
 
-    # H1
     df_h1, _ = fetch_deriv(200, 3600)
     if df_h1 is None:
         df_h1, _ = fetch_yf_gc("60d", "1h", min_len=100)
@@ -273,7 +266,6 @@ def get_price_and_data():
     if df_h1 is None:
         df_h1 = df_m15
 
-    # H4
     df_h4, _ = fetch_deriv(200, 14400)
     if df_h4 is None:
         df_h4, _ = fetch_yf_gc("1y", "1d", min_len=50)
@@ -327,137 +319,6 @@ def trend_label(df):
         return "SIDEWAYS"
     except Exception:
         return "NEUTRAL"
-
-
-# =============================================================================
-# 10 ENGINES
-# =============================================================================
-def NADI(df):
-    try:
-        e9 = df["close"].ewm(9).mean().iloc[-1]
-        e21 = df["close"].ewm(21).mean().iloc[-1]
-        p = float(df["close"].iloc[-1])
-        if p > e9 and e9 > e21:
-            return (1, 1.5)
-        if p < e9 and e9 < e21:
-            return (-1, 1.5)
-        return (0, 1.5)
-    except Exception:
-        return (0, 1.5)
-
-
-def SAWAH(df):
-    try:
-        hi = df["high"].rolling(50).max().iloc[-1]
-        lo = df["low"].rolling(50).min().iloc[-1]
-        p = float(df["close"].iloc[-1])
-        if p > lo + (hi - lo) * 0.618:
-            return (1, 1.5)
-        if p < lo + (hi - lo) * 0.382:
-            return (-1, 1.5)
-        return (0, 1.5)
-    except Exception:
-        return (0, 1.5)
-
-
-def SEMUT(df):
-    try:
-        e50 = df["close"].ewm(50).mean().iloc[-1]
-        p = float(df["close"].iloc[-1])
-        return (1, 1.2) if p > e50 else (-1, 1.2)
-    except Exception:
-        return (0, 1.2)
-
-
-def PADI(df):
-    try:
-        r = float(rsi(df).iloc[-1])
-        if r > 55:
-            return (1, 1.3)
-        if r < 45:
-            return (-1, 1.3)
-        return (0, 1.3)
-    except Exception:
-        return (0, 1.3)
-
-
-def AKAR(df):
-    try:
-        s = df["close"].rolling(200).mean().iloc[-1] if len(df) >= 200 \
-            else df["close"].mean()
-        p = float(df["close"].iloc[-1])
-        return (1, 1.8) if p > s else (-1, 1.8)
-    except Exception:
-        return (0, 1.8)
-
-
-def WAYANG(df):
-    try:
-        hi = df["high"].rolling(20).max().iloc[-1]
-        lo = df["low"].rolling(20).min().iloc[-1]
-        p = float(df["close"].iloc[-1])
-        return (1, 1.0) if p > (hi + lo) / 2 else (-1, 1.0)
-    except Exception:
-        return (0, 1.0)
-
-
-def LUMPUR(df):
-    try:
-        v = float(df["volume"].iloc[-1])
-        vm = float(df["volume"].rolling(20).mean().iloc[-1])
-        p = float(df["close"].iloc[-1])
-        pp = float(df["close"].iloc[-2])
-        if v > vm and p > pp:
-            return (1, 1.1)
-        if v > vm and p < pp:
-            return (-1, 1.1)
-        return (0, 1.1)
-    except Exception:
-        return (0, 1.1)
-
-
-def API(df):
-    try:
-        b = float((df["close"] - df["open"]).abs().iloc[-1])
-        ab = float((df["close"] - df["open"]).abs().rolling(20).mean().iloc[-1])
-        p = float(df["close"].iloc[-1])
-        pp = float(df["close"].iloc[-2])
-        if b > ab and p > pp:
-            return (1, 1.0)
-        if b > ab and p < pp:
-            return (-1, 1.0)
-        return (0, 1.0)
-    except Exception:
-        return (0, 1.0)
-
-
-def ANGIN(df):
-    try:
-        hi = float(df["high"].iloc[-1])
-        lo = float(df["low"].iloc[-1])
-        c = float(df["close"].iloc[-1])
-        if (hi - c) > (c - lo) * 1.5:
-            return (-1, 1.0)
-        if (c - lo) > (hi - c) * 1.5:
-            return (1, 1.0)
-        return (0, 1.0)
-    except Exception:
-        return (0, 1.0)
-
-
-def EMBER(df):
-    try:
-        p = float(df["close"].iloc[-1])
-        m = float(df["close"].rolling(10).mean().iloc[-1])
-        return (1, 1.0) if p > m else (-1, 1.0)
-    except Exception:
-        return (0, 1.0)
-
-
-ENGINES = [("NADI", NADI), ("SAWAH", SAWAH), ("SEMUT", SEMUT),
-           ("PADI", PADI), ("AKAR", AKAR), ("WAYANG", WAYANG),
-           ("LUMPUR", LUMPUR), ("API", API), ("ANGIN", ANGIN),
-           ("EMBER", EMBER)]
 
 
 # =============================================================================
@@ -515,7 +376,6 @@ def process_evaluated(journal, df_m15, memory, calibrator, meta):
         t["evaluated"] = True
         t["result"] = res
         changed = True
-
         if res in ("WIN", "LOSS"):
             pnl_r = 0.0
             if res == "WIN":
@@ -528,17 +388,13 @@ def process_evaluated(journal, df_m15, memory, calibrator, meta):
             else:
                 pnl_r = -1.0
             t["pnl_r"] = pnl_r
-
             mid = t.get("memory_id")
             if mid:
                 memory.update(mid, res, pnl_r)
-
             regime = t.get("regime", "TRANSITION")
             meta.update(regime, res == "WIN", pnl_r)
-
             conf = t.get("adjusted_consensus", t.get("consensus", 60)) / 100.0
             calibrator.accumulate(conf, 1 if res == "WIN" else 0)
-
     if changed:
         _save(JOURNAL_FILE, journal)
     return changed
@@ -547,20 +403,38 @@ def process_evaluated(journal, df_m15, memory, calibrator, meta):
 # =============================================================================
 # CHART
 # =============================================================================
-def make_chart(df, entry, sl, tps, signal, conf, atr):
+def make_chart(df, entry_data, signal, conf, atr):
+    """Chart dengan zona entry FVG/OB + structural SL/TP."""
     try:
-        plt.figure(figsize=(10, 6))
-        sub = df.tail(80)
+        plt.figure(figsize=(11, 6))
+        sub = df.tail(100)
         x = sub.index if isinstance(sub.index, pd.DatetimeIndex) \
             else range(len(sub))
         plt.plot(x, sub["close"].values, color="gold", linewidth=1.5,
                  label="M15")
-        plt.axhline(entry, color="cyan", label=f"Entry {entry:.2f}")
-        plt.axhline(sl, color="red", label=f"SL {sl:.2f}")
-        plt.axhline(tps[0], color="green", linestyle=":", label="TP1")
-        plt.axhline(tps[2], color="green", linestyle="-", label="TP3")
-        plt.title(f"{signal} | conf {conf:.0f}% | ATR {atr:.2f}")
-        plt.legend(fontsize=8)
+
+        # Entry zone
+        plt.axhspan(entry_data.entry_low, entry_data.entry_high,
+                    color="cyan", alpha=0.25,
+                    label=f"Entry {entry_data.entry_low:.2f}-{entry_data.entry_high:.2f}")
+        plt.axhline(entry_data.entry_ideal, color="cyan",
+                    linestyle="--", linewidth=1)
+
+        # SL & TP
+        plt.axhline(entry_data.sl, color="red", linewidth=2,
+                    label=f"SL {entry_data.sl:.2f}")
+        plt.axhline(entry_data.tp1, color="green", linestyle=":",
+                    label=f"TP1 {entry_data.tp1:.2f} ({entry_data.rr_tp1}R)")
+        plt.axhline(entry_data.tp2, color="green", linestyle="--",
+                    label=f"TP2 {entry_data.tp2:.2f} ({entry_data.rr_tp2}R)")
+        plt.axhline(entry_data.tp3, color="green", linestyle="-",
+                    label=f"TP3 {entry_data.tp3:.2f} ({entry_data.rr_tp3}R)")
+
+        plt.title(f"{signal} | conf {conf:.0f}% | "
+                  f"Precision {entry_data.precision_score:.0f} "
+                  f"({entry_data.precision_grade}) | "
+                  f"{entry_data.entry_type}")
+        plt.legend(fontsize=8, loc="best")
         plt.grid(alpha=0.3)
         plt.tight_layout()
         p = os.path.join(CACHE_DIR, "chart.png")
@@ -577,13 +451,89 @@ def make_chart(df, entry, sl, tps, signal, conf, atr):
 
 
 # =============================================================================
+# CAPTION (override untuk precision entry)
+# =============================================================================
+def compose_precision_caption(signal, entry_data, atr, consensus,
+                               grade, grade_score, regime, anomaly,
+                               mem_stats, debate_res, source, offset,
+                               ai_insight):
+    import html as _html
+    bar_f = int(consensus / 10)
+    bar = "█" * bar_f + "░" * (10 - bar_f)
+    regime_tag = {
+        "TRENDING_UP": "📈 TREND UP", "TRENDING_DOWN": "📉 TREND DOWN",
+        "RANGING": "↔️ RANGING", "VOLATILE": "⚡ VOLATILE",
+        "QUIET": "😴 QUIET", "TRANSITION": "🔄 TRANSITION",
+    }.get(regime.regime.value, "❓")
+    emoji = "🟢" if signal == "BUY" else "🔴"
+
+    mem_line = "—"
+    if mem_stats.get("n", 0) >= 5:
+        mem_line = (f"{mem_stats['n']} case | WR {mem_stats['winrate']:.0f}% "
+                    f"| avg {mem_stats['avg_r']:+.2f}R")
+
+    debate_line = ""
+    if debate_res.get("verdict") and debate_res["verdict"] != "ABSTAIN":
+        de = {"AGREE": "✅", "DISAGREE": "❌"}.get(debate_res["verdict"], "⚪")
+        debate_line = f"\n{de} <b>AI Council:</b> {debate_res['verdict']}"
+        if debate_res.get("notes"):
+            debate_line += f" — <i>{_html.escape(debate_res['notes'][:100])}</i>"
+
+    tp_lines = "\n".join([
+        f"  <b>TP{i+1}:</b> <code>{tp:.2f}</code> "
+        f"({rr:.2f}R) <i>{entry_data.tp_reasons[i]}</i>"
+        for i, (tp, rr) in enumerate([
+            (entry_data.tp1, entry_data.rr_tp1),
+            (entry_data.tp2, entry_data.rr_tp2),
+            (entry_data.tp3, entry_data.rr_tp3),
+            (entry_data.tp4, 0.0),
+        ])
+    ])
+
+    off_line = f" | offset {offset:+.2f}" if offset else ""
+    ai_safe = _html.escape(ai_insight[:350]) if ai_insight else "-"
+
+    entry_type_label = {
+        "FVG_FILL": "🎯 FVG Fill",
+        "OB_RETEST": "🎯 Order Block Retest",
+        "STRUCTURE_PULLBACK": "🎯 Structure Pullback",
+    }.get(entry_data.entry_type, "🎯")
+
+    return (
+        f"{emoji} <b>XAUUSD {signal}</b> — Grade <b>{grade}</b>\n"
+        f"<b>Precision: {entry_data.precision_score:.0f}/100 "
+        f"({entry_data.precision_grade})</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 Confidence: [{bar}] {consensus:.0f}%\n"
+        f"🌊 Regime: {regime_tag} (conf {regime.confidence:.2f})\n"
+        f"📡 Source: {_html.escape(source)}{off_line}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{entry_type_label}\n"
+        f"<b>Entry Zone:</b> <code>{entry_data.entry_low:.2f} - "
+        f"{entry_data.entry_high:.2f}</code>\n"
+        f"<b>Entry Ideal:</b> <code>{entry_data.entry_ideal:.2f}</code>\n"
+        f"<b>SL:</b> <code>{entry_data.sl:.2f}</code> "
+        f"<i>({entry_data.sl_reason})</i>\n"
+        f"<b>Risk:</b> {entry_data.risk_points:.2f} pts\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{tp_lines}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🧠 Memory: {mem_line}\n"
+        f"⚡ Anomaly: {anomaly.score:.2f}"
+        f"{debate_line}\n"
+        f"🤖 <i>{ai_safe}</i>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"⏰ {datetime.datetime.now(WIB).strftime('%H:%M WIB | %d-%m')}"
+    )
+
+
+# =============================================================================
 # MAIN
 # =============================================================================
 def main():
     log("=" * 60)
-    log("XAUUSD AGI ENGINE v30.2 START")
+    log("XAUUSD AGI ENGINE v31.0 START")
     log("=" * 60)
-
     _ping("start")
 
     _init_db()
@@ -591,17 +541,15 @@ def main():
     fail = _load(FAIL_FILE, {"count": 0})
 
     if is_paused() and not FORCE_RUN:
-        log("Paused via /pause. Skip.")
+        log("Paused. Skip.")
         _ping("paused")
         return 0
 
-    # Gemini API key check
     if GEMINI_API_KEY:
         log(f"[Gemini] API key present (len={len(GEMINI_API_KEY)})")
     else:
-        log("[Gemini] ⚠️ API key MISSING — debate/reflection disabled")
+        log("[Gemini] ⚠️ No API key — debate disabled")
 
-    # Fetch data
     try:
         price, df_m15, df_h1, df_h4, source, offset = get_price_and_data()
         fail["count"] = 0
@@ -612,17 +560,16 @@ def main():
         log(f"Data fetch failed: {e}")
         if fail["count"] >= 2:
             send_text(TELEGRAM_BOT_TOKEN,
-                      f"🚨 <b>ALERT</b>: data fetch gagal {fail['count']}x",
-                      None)
+                      f"🚨 <b>ALERT</b>: fetch gagal {fail['count']}x", None)
         _ping("fail_fetch")
         return 1
 
     memory = Memory()
     calibrator = Calibrator()
     meta = MetaLearner()
-
     process_evaluated(journal, df_m15, memory, calibrator, meta)
 
+    # Regime + anomaly
     regime = detect_regime(df_m15)
     anomaly = detect_anomaly(df_m15)
     _, mem_stats = memory.query(df_m15, k=20)
@@ -631,34 +578,39 @@ def main():
     h4_trend = trend_label(df_h4) if df_h4 is not None else "NEUTRAL"
     h1_rsi = float(rsi(df_h1).iloc[-1])
 
-    # Scoring
+    # Scoring dari 10 institutional engines
     buy_w = sell_w = 0.0
     states = {}
+    bullish_engines = bearish_engines = 0
     for name, fn in ENGINES:
         try:
             sc, w = fn(df_m15)
             states[name] = {"sc": sc, "weight_used": w}
             if sc > 0:
                 buy_w += w * abs(sc)
+                bullish_engines += 1
             elif sc < 0:
                 sell_w += w * abs(sc)
-        except Exception:
+                bearish_engines += 1
+        except Exception as e:
             states[name] = {"sc": 0, "weight_used": 1.0}
+            log(f"Engine {name} err: {e}")
 
+    # HTF bias
     if "BULLISH" in h1_trend:
-        buy_w += 2.0
+        buy_w += 2.5
     elif "BEARISH" in h1_trend:
-        sell_w += 2.0
+        sell_w += 2.5
 
     if df_h4 is not None:
         if "BULLISH" in h4_trend:
-            buy_w += 0.75
+            buy_w += 1.0
         elif "BEARISH" in h4_trend:
-            sell_w += 0.75
+            sell_w += 1.0
 
     total_w = buy_w + sell_w
     if total_w == 0 or buy_w == sell_w:
-        log("Neutral market. Skip.")
+        log("Neutral. Skip.")
         _ping("neutral")
         return 0
 
@@ -666,92 +618,118 @@ def main():
     signal = "BUY" if buy_w > sell_w else "SELL"
 
     penalty = meta.penalty(regime.regime.value)
-    adjusted = consensus * penalty
-    adjusted = max(0, min(100, adjusted))
+    adjusted = max(0, min(100, consensus * penalty))
 
     log(f"Signal={signal} consensus={consensus:.1f}% "
         f"adjusted={adjusted:.1f}% regime={regime.regime.value} "
-        f"anomaly={anomaly.score:.2f}")
+        f"anomaly={anomaly.score:.2f} "
+        f"engines_bull={bullish_engines} bear={bearish_engines}")
 
+    # Confluence gate
     if adjusted < MIN_CONFLUENCE:
         log(f"Below threshold {MIN_CONFLUENCE}. Skip.")
         _ping("low_score")
         return 0
 
-    grade_info = grade_signal(adjusted, signal, states, h1_trend, h4_trend,
-                               calc_atr(df_m15), mem_stats, anomaly.score)
-    log(f"Grade={grade_info['grade']} score={grade_info['score']}")
+    # MTF alignment wajib
+    if REQUIRE_MTF_ALIGN and not FORCE_RUN:
+        aligned = (
+            (signal == "BUY" and "BULLISH" in h1_trend and
+             ("BULLISH" in h4_trend or h4_trend == "NEUTRAL")) or
+            (signal == "SELL" and "BEARISH" in h1_trend and
+             ("BEARISH" in h4_trend or h4_trend == "NEUTRAL"))
+        )
+        if not aligned:
+            log(f"MTF not aligned: signal={signal} H1={h1_trend} "
+                f"H4={h4_trend}. Skip.")
+            _ping("mtf_unaligned")
+            return 0
 
-    # QUIET regime guard
-    if (regime.regime.value == "QUIET"
-            and grade_info["grade"] in ("A", "B", "C", "D")
-            and not FORCE_RUN):
-        log(f"QUIET regime + grade {grade_info['grade']} -> skip")
-        _ping("quiet_low_grade")
+    # Anomaly gate
+    if anomaly.is_anomaly and not FORCE_RUN:
+        log(f"Anomaly {anomaly.score:.2f}. Skip.")
+        _ping("anomaly")
         return 0
+
+    # Grade
+    atr_val = calc_atr(df_m15)
+    grade_info = grade_signal(adjusted, signal, states, h1_trend, h4_trend,
+                               atr_val, mem_stats, anomaly.score)
+    log(f"Grade={grade_info['grade']} score={grade_info['score']}")
 
     if not grade_at_least(grade_info["grade"], MIN_GRADE) and not FORCE_RUN:
         log(f"Grade below {MIN_GRADE}. Skip.")
         _ping("low_grade")
         return 0
 
-    if anomaly.is_anomaly and not FORCE_RUN:
-        log(f"Anomaly {anomaly.score:.2f} too high. Skip.")
-        _ping("anomaly_high")
+    # **PRECISION ENTRY**
+    log("Calculating precision entry...")
+    entry_data = calculate_precise_entry(
+        df_m15, signal, price, h4_trend, h1_trend, adjusted, atr_val
+    )
+    log(f"[Precision] {entry_data.precision_grade} "
+        f"({entry_data.precision_score}/100) | "
+        f"type={entry_data.entry_type} | "
+        f"entry={entry_data.entry_low:.2f}-{entry_data.entry_high:.2f} | "
+        f"SL={entry_data.sl:.2f} | "
+        f"TP1={entry_data.tp1:.2f} ({entry_data.rr_tp1}R) | "
+        f"TP2={entry_data.tp2:.2f} ({entry_data.rr_tp2}R) | "
+        f"TP3={entry_data.tp3:.2f} ({entry_data.rr_tp3}R)")
+
+    if entry_data.precision_score < MIN_PRECISION and not FORCE_RUN:
+        log(f"Precision {entry_data.precision_score} < {MIN_PRECISION}. Skip.")
+        _ping("low_precision")
         return 0
 
+    # Anti-spam
     if is_duplicate(signal, price, COOLDOWN_MIN) and not FORCE_RUN:
-        log("Duplicate signal. Skip.")
+        log("Duplicate. Skip.")
         _ping("duplicate")
         return 0
 
     # Gemini debate
     if GEMINI_API_KEY:
         debate_res = debate(signal, price, adjusted, regime.regime.value,
-                            h1_trend, h4_trend, h1_rsi, calc_atr(df_m15),
+                            h1_trend, h4_trend, h1_rsi, atr_val,
                             mem_stats, anomaly.score, GEMINI_API_KEY)
-        log(f"Debate verdict={debate_res['verdict']} "
-            f"mult={debate_res['confidence_mult']} "
-            f"notes={debate_res.get('notes', '')[:60]}")
+        log(f"Debate={debate_res['verdict']} "
+            f"mult={debate_res['confidence_mult']}")
     else:
         debate_res = {"verdict": "ABSTAIN", "confidence_mult": 1.0,
-                      "notes": "no_api_key", "raw": ""}
-        log("[Gemini] Skipped — no API key")
-
-    adjusted *= debate_res["confidence_mult"]
-    adjusted = max(0, min(100, adjusted))
+                      "notes": "no_key", "raw": ""}
 
     if debate_res["verdict"] == "DISAGREE" and not FORCE_RUN:
-        log("AI Council DISAGREE. Skip.")
+        log("Debate DISAGREE. Skip.")
         _ping("debate_disagree")
         return 0
 
-    # SL/TP
-    now_h = datetime.datetime.now(WIB).hour
-    sess = 1.35 if (13 <= now_h <= 23 or now_h <= 2) else 1.15
-    atr = calc_atr(df_m15)
-    sl_base = max(6.0, min(16.0, atr * sess)) + 1.2
-
-    entry = price
-    if signal == "BUY":
-        sl = entry - sl_base
-        tps = [entry + sl_base * m for m in (1.3, 2.2, 3.5, 5.0)]
-    else:
-        sl = entry + sl_base
-        tps = [entry - sl_base * m for m in (1.3, 2.2, 3.5, 5.0)]
-
     # Save memory + journal
-    mem_id = memory.store(df_m15, regime, signal, entry, outcome="OPEN",
-                           extra={"grade": grade_info["grade"]})
+    mem_id = memory.store(df_m15, regime, signal,
+                           entry_data.entry_ideal, outcome="OPEN",
+                           extra={"grade": grade_info["grade"],
+                                  "precision": entry_data.precision_score})
     trade = {
         "time": datetime.datetime.now(WIB).isoformat(),
-        "signal": signal, "price": float(entry),
-        "sl": round(sl, 2), "tp1": round(tps[0], 2),
-        "tp2": round(tps[1], 2), "tp3": round(tps[2], 2),
-        "tp4": round(tps[3], 2),
+        "signal": signal,
+        "price": entry_data.entry_ideal,
+        "entry_low": entry_data.entry_low,
+        "entry_high": entry_data.entry_high,
+        "entry_type": entry_data.entry_type,
+        "sl": entry_data.sl,
+        "tp1": entry_data.tp1,
+        "tp2": entry_data.tp2,
+        "tp3": entry_data.tp3,
+        "tp4": entry_data.tp4,
+        "rr_tp1": entry_data.rr_tp1,
+        "rr_tp2": entry_data.rr_tp2,
+        "rr_tp3": entry_data.rr_tp3,
+        "risk_points": entry_data.risk_points,
         "consensus": round(consensus, 2),
         "adjusted_consensus": round(adjusted, 2),
-        "grade": grade_info["grade"], "grade_score": grade_info["score"],
+        "grade": grade_info["grade"],
+        "grade_score": grade_info["score"],
+        "precision_score": entry_data.precision_score,
+        "precision_grade": entry_data.precision_grade,
         "regime": regime.regime.value,
         "anomaly_score": anomaly.score,
         "debate_verdict": debate_res["verdict"],
@@ -767,42 +745,31 @@ def main():
     if len(journal) > 200:
         journal = journal[-200:]
     _save(JOURNAL_FILE, journal)
-    save_signal(signal, entry)
+    save_signal(signal, entry_data.entry_ideal)
 
-    # AI insight (local)
     ai = compose_local_insight(signal, adjusted, regime.regime.value,
                                 h1_trend, h4_trend, mem_stats, anomaly.score)
 
-    # Caption
-    caption = compose_caption(
-        signal=signal, entry=entry, sl=sl, tps=tps, atr=atr,
-        consensus=adjusted, grade=grade_info["grade"],
-        grade_score=grade_info["score"], regime=regime, anomaly=anomaly,
-        memory_stats=mem_stats, debate_verdict=debate_res["verdict"],
-        debate_notes=debate_res.get("notes", ""), source=source,
-        offset=offset, ai_insight=ai,
+    caption = compose_precision_caption(
+        signal, entry_data, atr_val, adjusted,
+        grade_info["grade"], grade_info["score"], regime, anomaly,
+        mem_stats, debate_res, source, offset, ai,
     )
 
-    # Yahoo delay warning
     if source == "Yahoo GC=F":
-        caption += (f"\n⚠️ <i>Yahoo data delay ~10m. "
-                    f"Offset={offset:+.2f}. Verify sebelum entry.</i>")
+        caption += (f"\n⚠️ <i>Yahoo delay ~10m. "
+                    f"Verify harga di MT5 sebelum limit order.</i>")
 
-    # Chart + send
-    chart = make_chart(df_m15, entry, sl, tps, signal, adjusted, atr)
+    chart = make_chart(df_m15, entry_data, signal, adjusted, atr_val)
     if chart and os.path.exists(chart):
         send_photo(TELEGRAM_BOT_TOKEN, caption, chart)
     else:
         send_text(TELEGRAM_BOT_TOKEN, caption, None)
 
-    log(f"✅ SIGNAL SENT: {signal} @ {entry:.2f} ({adjusted:.0f}%) "
-        f"grade {grade_info['grade']}")
+    log(f"✅ SENT: {signal} entry={entry_data.entry_ideal:.2f} "
+        f"SL={entry_data.sl:.2f} precision={entry_data.precision_grade}")
 
-    # Reflection every 10 trades
-    refl = reflect(journal, regime.regime.value, GEMINI_API_KEY, interval=10)
-    if refl:
-        log("Reflection updated.")
-
+    reflect(journal, regime.regime.value, GEMINI_API_KEY, interval=10)
     _ping("success")
     return 0
 
