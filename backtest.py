@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
 =============================================================================
-BACKTEST HARNESS v31.2 (LEVEL 3)
+BACKTEST HARNESS v31.3 (LEVEL 3)
 =============================================================================
-Fix: Fallback Deriv -> Yahoo GC=F untuk GitHub Actions.
+Fix: Yahoo fetch lokal tanpa truncate 300 bar.
 =============================================================================
 """
 
@@ -16,6 +16,7 @@ from dataclasses import dataclass, asdict, field
 from typing import List, Dict, Optional
 import numpy as np
 import pandas as pd
+import yfinance as yf
 
 from engines import ENGINES, find_swings, detect_fvg, detect_order_blocks
 from precision_entry import calculate_precise_entry
@@ -58,6 +59,40 @@ class BacktestResult:
     trades: List[dict] = field(default_factory=list)
 
 
+# =============================================================================
+# YAHOO DIRECT FETCH (TANPA TRUNCATE)
+# =============================================================================
+def _fetch_yahoo(symbol: str = "GC=F", period: str = "60d",
+                  interval: str = "15m") -> Optional[pd.DataFrame]:
+    """Fetch Yahoo tanpa truncate. Return DataFrame dengan DatetimeIndex UTC."""
+    try:
+        raw = yf.Ticker(symbol).history(period=period, interval=interval,
+                                          auto_adjust=False)
+        if raw is None or len(raw) < 50:
+            return None
+        raw = raw.reset_index()
+        dc = next((c for c in raw.columns if "date" in c.lower()),
+                  raw.columns[0])
+        raw = raw.rename(columns={dc: "datetime", "Close": "close",
+                                   "High": "high", "Low": "low", "Open": "open"})
+        if "Volume" in raw.columns:
+            raw["volume"] = pd.to_numeric(raw["Volume"],
+                                           errors="coerce").fillna(100.0)
+        else:
+            raw["volume"] = 100.0
+        raw["datetime"] = pd.to_datetime(raw["datetime"], utc=True,
+                                          errors="coerce")
+        raw = raw.dropna(subset=["datetime", "close", "high", "low", "open"])
+        raw = raw.set_index("datetime").sort_index()
+        return raw[["open", "high", "low", "close", "volume"]]
+    except Exception as e:
+        print(f"  Yahoo error: {e}")
+        return None
+
+
+# =============================================================================
+# ENGINE SCORING / EXIT SIM / FINALIZE / REPORT (sama seperti v31.2)
+# =============================================================================
 def _atr(df, p=14):
     try:
         h, l, c = df["high"], df["low"], df["close"]
@@ -372,81 +407,39 @@ def save_report(r, path):
 
 
 # =============================================================================
-# DATA LOADERS (FIX: fallback Deriv -> Yahoo)
+# DATA LOADER (pakai Yahoo langsung, tanpa truncate)
 # =============================================================================
 def load_from_deriv(days=60):
-    """Fetch data dengan fallback: Deriv -> Yahoo GC=F."""
-    import importlib.util
-    spec = importlib.util.spec_from_file_location(
-        "quant_engine", os.path.join(os.path.dirname(__file__),
-                                       "quant_engine.py"))
-    q = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(q)
+    """Fetch data Yahoo GC=F tanpa truncate 300 bar."""
+    print(f"Loading {days} days data...")
 
-    bars = min(5000, days * 96)
-    print(f"Fetching {bars} bars (M15)...")
-
-    # --- M15 ---
-    df_m15 = None
-    try:
-        print("  Trying Deriv M15...")
-        df_m15, _ = q.fetch_deriv(bars, 900)
-    except Exception as e:
-        print(f"  Deriv M15 error: {e}")
-
+    # --- M15: Yahoo max 60d untuk 15m ---
+    yf_days = min(days, 55)
+    print(f"  Fetching M15 ({yf_days}d)...")
+    df_m15 = _fetch_yahoo("GC=F", f"{yf_days}d", "15m")
     if df_m15 is None or len(df_m15) < 500:
-        print("  Deriv gagal, fallback ke Yahoo GC=F M15...")
-        yf_days = min(days, 55)
-        try:
-            df_m15, _ = q.fetch_yf_gc(f"{yf_days}d", "15m", min_len=200)
-        except Exception as e:
-            print(f"  Yahoo M15 error: {e}")
-
-    if df_m15 is None or len(df_m15) < 200:
-        raise RuntimeError("Semua sumber M15 gagal (Deriv + Yahoo)")
-
+        raise RuntimeError(f"M15 fetch gagal, hanya dapat "
+                            f"{len(df_m15) if df_m15 is not None else 0} bars")
     print(f"  M15 OK: {len(df_m15)} bars")
 
-    # --- H1 ---
-    df_h1 = None
-    try:
-        print("  Trying Deriv H1...")
-        df_h1, _ = q.fetch_deriv(2000, 3600)
-    except Exception:
-        pass
-
-    if df_h1 is None or len(df_h1) < 100:
-        print("  Fallback Yahoo H1...")
-        yf_days_h1 = min(days + 30, 180)
-        try:
-            df_h1, _ = q.fetch_yf_gc(f"{yf_days_h1}d", "1h", min_len=100)
-        except Exception:
-            pass
-
+    # --- H1: Yahoo max 730d ---
+    print(f"  Fetching H1...")
+    df_h1 = _fetch_yahoo("GC=F", "180d", "1h")
     if df_h1 is None or len(df_h1) < 100:
         print("  H1 gagal, pakai M15")
         df_h1 = df_m15
+    else:
+        print(f"  H1 OK: {len(df_h1)} bars")
 
-    # --- H4 ---
-    df_h4 = None
-    try:
-        print("  Trying Deriv H4...")
-        df_h4, _ = q.fetch_deriv(1000, 14400)
-    except Exception:
-        pass
-
-    if df_h4 is None or len(df_h4) < 50:
-        print("  Fallback Yahoo H4...")
-        try:
-            df_h4, _ = q.fetch_yf_gc("2y", "1d", min_len=50)
-        except Exception:
-            pass
-
+    # --- H4: pakai 1d sebagai proxy (Yahoo gak ada 4h) ---
+    print(f"  Fetching H4 (via 1d)...")
+    df_h4 = _fetch_yahoo("GC=F", "2y", "1d")
     if df_h4 is None or len(df_h4) < 50:
         print("  H4 gagal, pakai H1")
         df_h4 = df_h1
+    else:
+        print(f"  H4 OK: {len(df_h4)} bars")
 
-    print(f"  H1 OK: {len(df_h1)} bars | H4 OK: {len(df_h4)} bars")
     return df_m15, df_h1, df_h4
 
 
