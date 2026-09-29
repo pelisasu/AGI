@@ -37,11 +37,14 @@ jobs:
             state-tune-
             state-
 
-      - name: Run engine
+     - name: Run engine
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          MIN_CONFLUENCE_SCORE: '60'
+          MIN_PRECISION_SCORE: '70'
+          MIN_SIGNAL_GRADE: 'A++'
         run: python quant_engine.py
 
       - name: Save state
